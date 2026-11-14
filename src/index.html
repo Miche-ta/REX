@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en" data-theme="oled">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>rex-music</title>
+    <script type="module" src="/main.js" defer></script>
+  </head>
+
+  <body>
+    <!-- Topbar & Signal Path HUD -->
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-logo">rex-music</span>
+      </div>
+
+      <div class="signal-hud" id="signal-hud">
+        <div class="signal-dot" id="signal-dot"></div>
+        <span class="signal-text" id="signal-hud-text">Signal Path: Idle</span>
+      </div>
+
+      <div class="topbar-controls">
+        <select id="quick-device-select" class="select-input" title="Output Audio Device">
+          <option value="default">Default System Audio</option>
+        </select>
+
+        <select id="quick-theme-select" class="select-input" title="Theme Selector">
+          <option value="oled">OLED Pure Black</option>
+          <option value="hifi">Studio Hi-Fi (Amber)</option>
+          <option value="cyberpunk">Cyberpunk Neon</option>
+          <option value="nord">Nordic Slate</option>
+          <option value="gruvbox">Gruvbox Dark</option>
+          <option value="snow">Minimalist Snow</option>
+        </select>
+      </div>
+    </header>
+
+    <!-- Main Workspace -->
+    <div class="app-body">
+      <!-- Sidebar Navigation -->
+      <nav class="sidebar">
+        <div class="nav-item active" data-view="now-playing">
+          <span>🎵</span> Now Playing
+        </div>
+        <div class="nav-item" data-view="library">
+          <span>📚</span> Music Library
+        </div>
+        <div class="nav-item" data-view="hardware">
+          <span>🎛️</span> Audio & DAC
+        </div>
+        <div class="nav-item" data-view="themes">
+          <span>🎨</span> Themes
+        </div>
+        <div class="nav-item" data-view="terminal">
+          <span>🖥️</span> Terminal
+        </div>
+      </nav>
+
+      <!-- Main Dynamic Content Views -->
+      <main class="main-content">
+        <!-- VIEW 1: Now Playing -->
+        <section id="now-playing-view" class="view-section active">
+          <div class="now-playing-container">
+            <div class="vinyl-wrapper" id="art-wrapper" title="Click to switch disc / square cover">
+              <img id="cover-img" alt="" hidden>
+              <div class="vinyl-record" id="vinyl-disc">
+                <div class="vinyl-center">
+                  <span>rex-music</span>
+                  <span id="vinyl-rate">BIT-PERFECT</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="now-playing-info">
+              <div>
+                <h1 class="track-title" id="np-title">No Track Selected</h1>
+                <p class="track-artist" id="np-artist">Select a track from the Music Library</p>
+                <p class="track-album" id="np-album"></p>
+              </div>
+
+              <div class="spec-badges">
+                <span class="badge highlight" id="np-badge-format">FLAC</span>
+                <span class="badge" id="np-badge-bits">16-bit</span>
+                <span class="badge" id="np-badge-rate">44.1 kHz</span>
+                <span class="badge highlight" id="np-badge-direct">Direct ALSA</span>
+                <span class="badge" id="np-badge-channels">Stereo</span>
+              </div>
+
+              <div class="signal-path-card">
+                <div class="signal-path-title">Bit-Perfect Signal Flow</div>
+                <div class="signal-path-chain" id="np-signal-chain">
+                  Source [Ready] ➔ rex-music [Bit-Exact Direct Pipeline] ➔ DAC [Awaiting Stream]
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="up-next">
+            <div class="up-next-head"><div class="signal-path-title">Up Next</div><span id="up-next-summary"></span></div>
+            <div id="up-next-list"><p class="up-next-empty">Play a track from the Music Library to build the queue.</p></div>
+          </div>
+        </section>
+
+        <!-- VIEW 2: Library -->
+        <section id="library-view" class="view-section">
+          <div class="library-header">
+            <div>
+              <h2>Local Music Library</h2>
+              <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">
+                Direct hardware streaming of FLAC, WAV, and OGG files.
+              </p>
+            </div>
+            <div style="display: flex; gap: 10px;">
+              <input type="text" id="library-search" class="search-input" placeholder="Search artist, title, album..." />
+              <button id="scan-folder-btn" class="btn-action">Scan Folder</button>
+            </div>
+          </div>
+
+          <div style="margin-bottom: 14px; display: flex; gap: 8px;">
+            <input type="text" id="scan-path-input" class="search-input" style="flex: 1;" placeholder="Directory to scan..." />
+            <button id="scan-demo-btn" class="btn-pill">Scan Demo Songs</button>
+          </div>
+
+          <table class="track-table">
+            <thead>
+              <tr>
+                <th style="width: 40px;">#</th>
+                <th>Title</th>
+                <th>Artist</th>
+                <th>Album</th>
+                <th>Format</th>
+                <th>Quality</th>
+                <th style="text-align: right;">Duration</th>
+              </tr>
+            </thead>
+            <tbody id="library-tbody">
+              <tr>
+                <td colspan="7" style="text-align: center; color: var(--text-muted); padding: 30px;">
+                  No music loaded yet. Click "Scan Folder" or "Scan Demo Songs" above!
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <!-- VIEW 3: Audio Hardware & DAC Setup -->
+        <section id="hardware-view" class="view-section">
+          <div class="library-header">
+            <div>
+              <h2>Hardware Audio Endpoints (ALSA)</h2>
+              <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">
+                Direct hardware devices (<code>hw:</code>) bypass all OS mixers and software resampling.
+              </p>
+            </div>
+            <button id="rescan-hw-btn" class="btn-action">Scan Soundcards</button>
+          </div>
+
+          <div class="hw-grid" id="hw-devices-grid">
+            <p style="color: var(--text-muted);">Scanning connected DACs and soundcards...</p>
+          </div>
+        </section>
+
+        <!-- VIEW 5: Terminal / Engine Log -->
+        <section id="terminal-view" class="view-section">
+          <div class="library-header">
+            <div>
+              <h2>Terminal</h2>
+              <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">
+                Live engine output: device open results, ALSA errors, fallbacks.
+              </p>
+            </div>
+            <button id="clear-logs-btn" class="btn-action">Clear</button>
+          </div>
+          <div class="terminal-box">
+            <div class="terminal-bar">
+              <span class="terminal-title">rex-music · engine output</span>
+            </div>
+            <div id="log-output" class="terminal-output log-output"></div>
+          </div>
+        </section>
+
+        <!-- VIEW 4: Themes & Customizer -->
+        <section id="themes-view" class="view-section">
+          <div class="library-header">
+            <div>
+              <h2>Community Themes & Customizer</h2>
+              <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">
+                rex-music themes are built with simple CSS variables. Click a preset or build your own!
+              </p>
+            </div>
+            <button id="export-theme-btn" class="btn-action">Export theme.json</button>
+          </div>
+
+          <h3 style="font-size: 0.95rem; margin-bottom: 12px; color: var(--text-secondary);">Preset Themes</h3>
+          <div class="theme-presets-grid" id="theme-presets">
+            <div class="theme-card active" data-theme-name="oled">
+              <div class="theme-preview" style="background: #000000; border-bottom: 4px solid #00e699;"></div>
+              <span class="theme-name">OLED Pure Black</span>
+            </div>
+            <div class="theme-card" data-theme-name="hifi">
+              <div class="theme-preview" style="background: #121316; border-bottom: 4px solid #e5a93c;"></div>
+              <span class="theme-name">Studio Hi-Fi</span>
+            </div>
+            <div class="theme-card" data-theme-name="cyberpunk">
+              <div class="theme-preview" style="background: #080914; border-bottom: 4px solid #00f0ff;"></div>
+              <span class="theme-name">Cyberpunk Neon</span>
+            </div>
+            <div class="theme-card" data-theme-name="nord">
+              <div class="theme-preview" style="background: #242933; border-bottom: 4px solid #88c0d0;"></div>
+              <span class="theme-name">Nordic Slate</span>
+            </div>
+            <div class="theme-card" data-theme-name="gruvbox">
+              <div class="theme-preview" style="background: #1d2021; border-bottom: 4px solid #fabd2f;"></div>
+              <span class="theme-name">Gruvbox Dark</span>
+            </div>
+            <div class="theme-card" data-theme-name="snow">
+              <div class="theme-preview" style="background: #ffffff; border-bottom: 4px solid #0070f3;"></div>
+              <span class="theme-name">Minimalist Snow</span>
+            </div>
+          </div>
+
+          <div class="custom-theme-box">
+            <h3 class="custom-theme-title">Live CSS Theme Customizer</h3>
+            <p style="font-size: 0.78rem; color: var(--text-muted); margin-bottom: 14px;">
+              Tweak these colors live! When you're happy, export it as <code>theme.json</code> to share with the community.
+            </p>
+            <div class="color-input-row">
+              <span>App Background (<code>--bg-app</code>)</span>
+              <input type="color" id="picker-bg-app" value="#000000" />
+            </div>
+            <div class="color-input-row">
+              <span>Card Background (<code>--bg-card</code>)</span>
+              <input type="color" id="picker-bg-card" value="#0f1115" />
+            </div>
+            <div class="color-input-row">
+              <span>Accent & Glow (<code>--accent</code>)</span>
+              <input type="color" id="picker-accent" value="#00e699" />
+            </div>
+            <div class="color-input-row">
+              <span>Primary Text (<code>--text-primary</code>)</span>
+              <input type="color" id="picker-text" value="#f5f7fa" />
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <!-- Bottom Audio Player Bar -->
+    <footer class="player-bar">
+      <!-- Interactive Scrubber Timeline -->
+      <div class="scrubber-row">
+        <span class="time-label" id="time-current">0:00</span>
+        <div class="progress-track" id="progress-bar">
+          <div class="progress-fill" id="progress-fill"></div>
+        </div>
+        <span class="time-label right" id="time-duration">0:00</span>
+      </div>
+
+      <!-- Controls Row -->
+      <div class="controls-row">
+        <div class="mini-track-info">
+          <div class="mini-title" id="mini-title">Idle</div>
+          <div class="mini-artist" id="mini-artist">rex-music</div>
+        </div>
+
+        <div class="center-controls">
+          <button class="ctrl-btn mode-btn" id="btn-shuffle" title="Shuffle">⇄</button>
+          <button class="ctrl-btn" id="btn-prev" title="Previous Track">⏮</button>
+          <button class="ctrl-btn play-btn" id="btn-play" title="Play / Pause">▶</button>
+          <button class="ctrl-btn" id="btn-next" title="Next Track">⏭</button>
+          <button class="ctrl-btn" id="btn-stop" title="Stop">⏹</button>
+          <button class="ctrl-btn mode-btn" id="btn-repeat" title="Repeat">↻</button>
+        </div>
+
+        <div class="right-controls">
+          <span id="vol-icon" title="DAC hardware volume (bit-perfect safe)">🔊</span>
+          <input type="range" id="volume-slider" min="0" max="100" value="50">
+          <span id="vol-label" class="time-label">--</span>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>

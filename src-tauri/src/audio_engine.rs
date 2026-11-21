@@ -32,6 +32,8 @@ pub struct PlaybackStatus {
     pub active_device_id: String,
     pub active_hardware_rate: u32,
     pub active_hardware_format: String,
+    pub active_buffer_frames: u64,
+    pub active_period_frames: u64,
     pub is_bit_perfect: bool,
     pub ended: bool, // true only when the track played to its natural end
 }
@@ -53,6 +55,8 @@ impl Default for PlaybackStatus {
             active_device_id: "default".into(),
             active_hardware_rate: 44100,
             active_hardware_format: "None".into(),
+            active_buffer_frames: 0,
+            active_period_frames: 0,
             is_bit_perfect: false,
             ended: false,
         }
@@ -132,6 +136,7 @@ fn run_audio_worker(
                 while let Some((f, d)) = next.take() {
                     play_file_loop(&rx, &status, &f, &d, &mut next);
                 }
+                release_device_to_pipewire();
             }
             EngineCommand::Stop => {
                 let mut st = status.lock().unwrap();
@@ -223,6 +228,8 @@ fn play_file_loop(
     log_msg("INFO", format!("Track Format: {} Hz · {}-bit · {} channels · Duration: {:.2}s", sample_rate, bits_per_sample, channels, duration_seconds));
     log_msg("ALSA", format!("Requesting audio output endpoint: '{}'", device_id));
 
+    claim_device_from_pipewire(device_id);
+
     // Open target PCM. EBUSY can linger briefly after the previous stream closes, so retry.
     // Never fall back to another device: "default" may be a mic or the resampling mixer.
     let mut opened = None;
@@ -248,6 +255,8 @@ fn play_file_loop(
 
     // Configure Hardware Parameters for True Bit-Perfect Output
     let mut actual_rate = sample_rate;
+    let mut actual_buffer: u64 = 0;
+    let mut actual_period: u64 = 0;
     let mut actual_format_str = "S16_LE".to_string();
     let mut use_32bit_output = false;
 
@@ -291,6 +300,11 @@ fn play_file_loop(
         // 4. Request the exact sample rate (e.g. 192000, 96000, 44100)
         let _ = hwp.set_rate_near(sample_rate, ValueOr::Nearest);
 
+        // Bounded buffer: 500ms buffer / 100ms period (MPD-like). The default is the device
+        // maximum (~2s), which is hard on USB audio and makes seeks lag.
+        let _ = hwp.set_buffer_time_near(500_000, ValueOr::Nearest);
+        let _ = hwp.set_period_time_near(100_000, ValueOr::Nearest);
+
         // Apply hardware params
         match pcm.hw_params(&hwp) {
             Ok(_) => {
@@ -298,6 +312,8 @@ fn play_file_loop(
                     if let Ok(r) = curr.get_rate() {
                         actual_rate = r;
                     }
+                    actual_buffer = curr.get_buffer_size().unwrap_or(0).max(0) as u64;
+                    actual_period = curr.get_period_size().unwrap_or(0).max(0) as u64;
                 }
                 log_msg("ALSA", format!("HwParams applied: {} Hz · {}", actual_rate, actual_format_str));
             }
@@ -342,6 +358,8 @@ fn play_file_loop(
         st.active_device_id = resolved_device_id;
         st.active_hardware_rate = actual_rate;
         st.active_hardware_format = actual_format_str;
+        st.active_buffer_frames = actual_buffer;
+        st.active_period_frames = actual_period;
         st.is_bit_perfect = is_true_bit_perfect;
     }
 
@@ -355,6 +373,7 @@ fn play_file_loop(
     let mut sample_buf_32: Vec<i32> = Vec::new();
 
     let mut reached_eof = false;
+    let mut write_failed = false;
     loop {
         // Handle incoming commands
         if let Ok(cmd) = rx.try_recv() {
@@ -420,6 +439,8 @@ fn play_file_loop(
             Ok(Some(pkt)) => pkt,
             Ok(None) => { reached_eof = true; break; } // Reached EOF
             Err(SymphoniaError::ResetRequired) => break,
+            // some demuxers report end of stream as an I/O error: still a natural end
+            Err(SymphoniaError::IoError(_)) => { reached_eof = true; break; }
             Err(_) => break,
         };
 
@@ -439,14 +460,22 @@ fn play_file_loop(
 
                     if let Ok(io) = pcm.io_i32() {
                         let mut frames_written = 0;
+                        let mut retries = 0;
                         while frames_written < num_frames {
                             let offset = frames_written * channels as usize;
                             let slice = &sample_buf_32[offset..];
                             match io.writei(slice) {
                                 Ok(w) => frames_written += w,
-                                Err(_) => {
-                                    let _ = pcm.try_recover(alsa::Error::new("pcm_write", -32), false);
-                                    break;
+                                Err(e) => {
+                                    // xrun etc.: recover and retry the SAME chunk (no lost samples).
+                                    // Unrecoverable (unplugged / stalled device): stop instead of spinning.
+                                    let msg = e.to_string();
+                                    retries += 1;
+                                    if retries > 5 || pcm.try_recover(e, true).is_err() {
+                                        log_msg("ERROR", format!("ALSA write failed, stopping playback: {msg}"));
+                                        write_failed = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -458,19 +487,29 @@ fn play_file_loop(
 
                     if let Ok(io) = pcm.io_i16() {
                         let mut frames_written = 0;
+                        let mut retries = 0;
                         while frames_written < num_frames {
                             let offset = frames_written * channels as usize;
                             let slice = &sample_buf_16[offset..];
                             match io.writei(slice) {
                                 Ok(w) => frames_written += w,
-                                Err(_) => {
-                                    let _ = pcm.try_recover(alsa::Error::new("pcm_write", -32), false);
-                                    break;
+                                Err(e) => {
+                                    // xrun etc.: recover and retry the SAME chunk (no lost samples).
+                                    // Unrecoverable (unplugged / stalled device): stop instead of spinning.
+                                    let msg = e.to_string();
+                                    retries += 1;
+                                    if retries > 5 || pcm.try_recover(e, true).is_err() {
+                                        log_msg("ERROR", format!("ALSA write failed, stopping playback: {msg}"));
+                                        write_failed = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
                     }
                 }
+
+                if write_failed { break; }
 
                 current_frame += num_frames as u64;
 
@@ -524,4 +563,49 @@ pub fn get_hw_volume(device_id: &str) -> Option<u32> {
         let v = sel.get_playback_volume(alsa::mixer::SelemChannelId::FrontLeft).ok()?;
         Some(if hi > lo { ((v - lo) * 100 / (hi - lo)) as u32 } else { 0 })
     })
+}
+
+// ---- PipeWire hand-off -------------------------------------------------------------------
+// PipeWire/WirePlumber keeps the DAC open, so a direct hw: open gets EBUSY. Suspending the
+// card's sink (what `pactl suspend-sink` does) makes PipeWire release it; we resume it afterwards.
+static SUSPENDED_SINKS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn pactl(args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("pactl").args(args).env("LC_ALL", "C").output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn card_of(device_id: &str) -> Option<String> {
+    let rest = device_id.strip_prefix("plughw:").or_else(|| device_id.strip_prefix("hw:"))?;
+    Some(rest.split(',').next()?.to_string())
+}
+
+fn claim_device_from_pipewire(device_id: &str) {
+    use crate::logger::log_msg;
+    let Some(card) = card_of(device_id) else { return };
+    let Some(listing) = pactl(&["list", "sinks"]) else { return }; // no pactl: nothing to do
+    let needle = format!("alsa.card = \"{card}\"");
+    let mut name: Option<String> = None;
+    for line in listing.lines().map(str::trim) {
+        if let Some(n) = line.strip_prefix("Name: ") {
+            name = Some(n.to_string());
+        } else if line == needle {
+            if let Some(n) = name.take() {
+                if pactl(&["suspend-sink", &n, "1"]).is_some() {
+                    log_msg("INFO", format!("Suspended PipeWire sink to free the DAC: {n}"));
+                    let mut held = SUSPENDED_SINKS.lock().unwrap();
+                    if !held.contains(&n) { held.push(n); }
+                }
+            }
+        }
+    }
+}
+
+/// Give suspended sinks back to PipeWire (end of playback, or app exit).
+pub fn release_device_to_pipewire() {
+    let sinks: Vec<String> = SUSPENDED_SINKS.lock().unwrap().drain(..).collect();
+    for n in sinks {
+        pactl(&["suspend-sink", &n, "0"]);
+        crate::logger::log_msg("INFO", format!("Returned sink to PipeWire: {n}"));
+    }
 }

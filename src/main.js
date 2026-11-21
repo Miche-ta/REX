@@ -1,167 +1,153 @@
 const { invoke } = window.__TAURI__.core;
 
+const $ = (id) => document.getElementById(id);
+const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+// localStorage can be missing or throw (private mode, blocked data): never depend on it.
+const store = {
+  get(k, d) { try { return localStorage.getItem(k) ?? d; } catch (_) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (_) {} },
+};
+
 // =====================================================================
-// Global State
+// State
 // =====================================================================
 let currentTrackList = [];
 let currentTrackIndex = -1;
 let currentDeviceId = "default";
+let deviceChosen = false; // false until the user (or a saved choice) picks an output
 let isPlaying = false;
 let isPaused = false;
 let currentDuration = 0;
 let currentPosition = 0;
 
 // =====================================================================
-// View Navigation
+// Views
 // =====================================================================
+const VIEWS = ["now-playing", "library", "hardware", "themes", "terminal"];
+
+function showView(name) {
+  if (!VIEWS.includes(name)) name = "now-playing";
+  document.querySelectorAll(".nav-item").forEach((i) => i.classList.toggle("active", i.dataset.view === name));
+  document.querySelectorAll(".view-section").forEach((s) => s.classList.toggle("active", s.id === `${name}-view`));
+  store.set("view", name);
+  if (name === "terminal") { const o = $("log-output"); o.scrollTop = o.scrollHeight; }
+}
+
 function initNavigation() {
-  const navItems = document.querySelectorAll(".nav-item");
-  const viewSections = document.querySelectorAll(".view-section");
-
-  navItems.forEach((item) => {
-    item.addEventListener("click", () => {
-      const viewName = item.getAttribute("data-view");
-
-      navItems.forEach((i) => i.classList.remove("active"));
-      item.classList.add("active");
-
-      viewSections.forEach((sec) => sec.classList.remove("active"));
-      const targetSec = document.getElementById(`${viewName}-view`);
-      if (targetSec) targetSec.classList.add("active");
-    });
-  });
+  document.querySelectorAll(".nav-item").forEach((i) => i.addEventListener("click", () => showView(i.dataset.view)));
+  showView(store.get("view", "now-playing"));
 }
 
 // =====================================================================
-// Hardware Audio Devices (ALSA Direct)
+// Output devices
 // =====================================================================
-async function loadAudioDevices() {
-  const grid = document.getElementById("hw-devices-grid");
-  const quickSelect = document.getElementById("quick-device-select");
+const isMic = (d) => /mic|capture/i.test(d.name);
 
+async function loadAudioDevices() {
+  const list = $("hw-devices-grid");
+  const sel = $("quick-device-select");
   try {
     const devices = await invoke("list_audio_devices");
     if (!devices || devices.length === 0) {
-      grid.innerHTML = "<p>No audio devices found.</p>";
+      list.innerHTML = '<p class="empty">No audio devices found.</p>';
       return;
     }
 
-    // If currentDeviceId is still "default", pick the first USB DAC (e.g. hw:2,0 or plughw:2,0)
-    if (currentDeviceId === "default") {
-      const bestHw = devices.find(d => d.id.startsWith("plughw:") || d.id.startsWith("hw:")) || devices[0];
-      if (bestHw) currentDeviceId = bestHw.id;
+    if (!deviceChosen) {
+      const saved = store.get("device", "");
+      const pick = devices.find((d) => d.id === saved)
+        || devices.find((d) => d.is_hardware && !isMic(d))
+        || devices.find((d) => !isMic(d))
+        || devices[0];
+      currentDeviceId = pick.id;
+      deviceChosen = true;
     }
 
-    // Populate topbar dropdown
-    quickSelect.innerHTML = devices.map(d => `
-      <option value="${d.id}" ${d.id === currentDeviceId ? 'selected' : ''}>
-        ${d.name} ${d.is_hardware ? '⚡ [Bit-Perfect]' : ''}
-      </option>
-    `).join("");
+    sel.innerHTML = devices.map((d) => `<option value="${esc(d.id)}">${esc(d.name)}${d.is_hardware ? " (direct)" : ""}</option>`).join("");
+    sel.value = currentDeviceId;
 
-    // Populate Hardware setup grid
-    grid.innerHTML = devices.map(d => `
-      <div class="hw-card ${d.id === currentDeviceId ? 'selected' : ''}" data-device-id="${d.id}">
-        <div class="hw-card-header">
+    list.innerHTML = devices.map((d) => {
+      const rates = d.supported_rates.length ? `${d.supported_rates.map((r) => r / 1000).join(" ")} kHz` : "rates managed by system";
+      const depths = [16, 24, 32].filter((b) => d[`supports_${b}bit`]);
+      return `
+        <div class="dev ${d.id === currentDeviceId ? "selected" : ""}" data-device-id="${esc(d.id)}" tabindex="0">
+          <span class="radio"></span>
           <div>
-            <div class="hw-card-name">${d.name}</div>
-            <div class="hw-card-id">${d.id}</div>
+            <div><span class="dev-name">${esc(d.name)}</span><span class="dev-id">${esc(d.id)}</span></div>
+            <div class="dev-spec">${rates}${depths.length ? ` · ${depths.join(" ")} bit` : ""}</div>
           </div>
-          ${d.is_hardware ? '<span class="badge highlight">Direct HW</span>' : '<span class="badge">Shared</span>'}
-        </div>
-        <p style="font-size: 0.78rem; color: var(--text-secondary);">${d.description || 'Hardware playback device'}</p>
-        
-        <div>
-          <span style="font-size: 0.7rem; color: var(--text-muted); font-weight: 700;">SUPPORTED RATES:</span>
-          <div class="pill-row" style="margin-top: 4px;">
-            ${d.supported_rates.length > 0
-              ? d.supported_rates.map(r => `<span class="pill">${r / 1000} kHz</span>`).join('')
-              : '<span class="pill">System Managed (Up to 192 kHz)</span>'}
-          </div>
-        </div>
-
-        <div>
-          <span style="font-size: 0.7rem; color: var(--text-muted); font-weight: 700;">BIT TRANSPARENCY:</span>
-          <div class="pill-row" style="margin-top: 4px;">
-            ${d.supports_16bit ? '<span class="pill">16-bit Integer</span>' : ''}
-            ${d.supports_24bit ? '<span class="pill">24-bit Integer</span>' : ''}
-            ${d.supports_32bit ? '<span class="pill">32-bit Integer</span>' : ''}
-          </div>
-        </div>
-
-        <button class="btn-action select-hw-btn" style="margin-top: 8px; width: 100%;" data-device-id="${d.id}">
-          ${d.id === currentDeviceId ? '✓ Active Output' : 'Select for Bit-Perfect Output'}
-        </button>
-      </div>
-    `).join("");
-
-    // Setup card selection
-    document.querySelectorAll(".select-hw-btn").forEach(btn => {
-      btn.addEventListener("click", () => {
-        currentDeviceId = btn.getAttribute("data-device-id");
-        quickSelect.value = currentDeviceId;
-        loadAudioDevices();
-      });
-    });
+          <span class="dev-kind">${d.id === currentDeviceId ? "active" : d.is_hardware ? "direct" : "shared"}</span>
+        </div>`;
+    }).join("");
 
     refreshVolume();
   } catch (err) {
-    grid.innerHTML = `<p style="color: #ff5555;">Error scanning ALSA devices: ${err}</p>`;
+    list.innerHTML = `<p class="empty">Could not list devices: ${esc(err)}</p>`;
   }
 }
 
+function chooseDevice(id) {
+  currentDeviceId = id;
+  deviceChosen = true;
+  store.set("device", id);
+  loadAudioDevices();
+}
+
+function initDevices() {
+  $("quick-device-select").addEventListener("change", (e) => chooseDevice(e.target.value));
+  $("rescan-hw-btn").addEventListener("click", loadAudioDevices);
+  const list = $("hw-devices-grid");
+  const pick = (e) => { const r = e.target.closest(".dev"); if (r) chooseDevice(r.dataset.deviceId); };
+  list.addEventListener("click", pick);
+  list.addEventListener("keydown", (e) => { if (e.key === "Enter") pick(e); });
+}
+
 // =====================================================================
-// Theme Engine (Community CSS Variables)
+// Themes
 // =====================================================================
+const THEME_VARS = ["--bg-app", "--bg-card", "--text-primary", "--accent"];
+
+function syncPickers() {
+  const cs = getComputedStyle(document.documentElement);
+  const get = (v) => cs.getPropertyValue(v).trim();
+  $("picker-bg-app").value = get("--bg-app");
+  $("picker-bg-card").value = get("--bg-card");
+  $("picker-accent").value = get("--accent");
+  $("picker-text").value = get("--text-primary");
+}
+
+function applyTheme(name) {
+  const root = document.documentElement;
+  THEME_VARS.forEach((v) => root.style.removeProperty(v)); // drop customizer overrides
+  root.setAttribute("data-theme", name);
+  store.set("rex-music-theme", name);
+  document.querySelectorAll(".theme-card").forEach((c) => c.classList.toggle("active", c.dataset.themeName === name));
+  syncPickers();
+}
+
 function initThemeEngine() {
-  const quickThemeSelect = document.getElementById("quick-theme-select");
-  const themeCards = document.querySelectorAll(".theme-card");
+  document.querySelectorAll(".theme-card").forEach((c) => c.addEventListener("click", () => applyTheme(c.dataset.themeName)));
+  applyTheme(store.get("rex-music-theme", "oled"));
 
-  const savedTheme = localStorage.getItem("rex-music-theme") || "oled";
-  applyTheme(savedTheme);
-  quickThemeSelect.value = savedTheme;
+  const bind = (id, v) => $(id).addEventListener("input", (e) => document.documentElement.style.setProperty(v, e.target.value));
+  bind("picker-bg-app", "--bg-app");
+  bind("picker-bg-card", "--bg-card");
+  bind("picker-accent", "--accent");
+  bind("picker-text", "--text-primary");
 
-  quickThemeSelect.addEventListener("change", (e) => {
-    applyTheme(e.target.value);
-  });
-
-  themeCards.forEach(card => {
-    card.addEventListener("click", () => {
-      const theme = card.getAttribute("data-theme-name");
-      applyTheme(theme);
-      quickThemeSelect.value = theme;
-    });
-  });
-
-  // Color Pickers for live customization
-  const pickBg = document.getElementById("picker-bg-app");
-  const pickCard = document.getElementById("picker-bg-card");
-  const pickAccent = document.getElementById("picker-accent");
-  const pickText = document.getElementById("picker-text");
-
-  pickBg.addEventListener("input", (e) => document.documentElement.style.setProperty("--bg-app", e.target.value));
-  pickCard.addEventListener("input", (e) => document.documentElement.style.setProperty("--bg-card", e.target.value));
-  pickAccent.addEventListener("input", (e) => {
-    document.documentElement.style.setProperty("--accent", e.target.value);
-    document.documentElement.style.setProperty("--progress-fill", e.target.value);
-  });
-  pickText.addEventListener("input", (e) => document.documentElement.style.setProperty("--text-primary", e.target.value));
-
-  // Export theme.json
-  document.getElementById("export-theme-btn").addEventListener("click", () => {
-    const themeObj = {
-      name: "Custom Community Theme",
-      author: "rex-music user",
+  $("export-theme-btn").addEventListener("click", () => {
+    const theme = {
+      name: "Custom theme",
       version: "1.0.0",
       colors: {
-        "--bg-app": pickBg.value,
-        "--bg-card": pickCard.value,
-        "--accent": pickAccent.value,
-        "--text-primary": pickText.value,
-      }
+        "--bg-app": $("picker-bg-app").value,
+        "--bg-card": $("picker-bg-card").value,
+        "--accent": $("picker-accent").value,
+        "--text-primary": $("picker-text").value,
+      },
     };
-    const blob = new Blob([JSON.stringify(themeObj, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
+    const url = URL.createObjectURL(new Blob([JSON.stringify(theme, null, 2)], { type: "application/json" }));
     const a = document.createElement("a");
     a.href = url;
     a.download = "rex-theme.json";
@@ -170,144 +156,161 @@ function initThemeEngine() {
   });
 }
 
-function applyTheme(themeName) {
-  document.documentElement.setAttribute("data-theme", themeName);
-  localStorage.setItem("rex-music-theme", themeName);
-
-  document.querySelectorAll(".theme-card").forEach(c => {
-    if (c.getAttribute("data-theme-name") === themeName) {
-      c.classList.add("active");
-    } else {
-      c.classList.remove("active");
-    }
-  });
-}
-
 // =====================================================================
-// Library Management
+// Library
 // =====================================================================
-async function initLibrary() {
-  const scanInput = document.getElementById("scan-path-input");
-  const scanBtn = document.getElementById("scan-folder-btn");
-  const scanDemoBtn = document.getElementById("scan-demo-btn");
-  const searchInput = document.getElementById("library-search");
-
-  // Get default music dir
-  try {
-    const defaultDir = await invoke("get_default_music_dir");
-    scanInput.value = defaultDir;
-  } catch (_) {}
-
-  scanBtn.addEventListener("click", async () => {
-    const dir = scanInput.value.trim();
-    if (!dir) return;
-    renderScanningState();
-    const tracks = await invoke("scan_music_directory", { dirPath: dir });
-    currentTrackList = tracks || [];
-    renderTrackTable(currentTrackList);
-  });
-
-  scanDemoBtn.addEventListener("click", async () => {
-    renderScanningState();
-    // Scan demo directory created in project
-    const tracks = await invoke("scan_music_directory", { dirPath: "demo" });
-    currentTrackList = tracks || [];
-    renderTrackTable(currentTrackList);
-  });
-
-  searchInput.addEventListener("input", (e) => {
-    const q = e.target.value.toLowerCase();
-    const filtered = currentTrackList.filter(t =>
-      t.title.toLowerCase().includes(q) ||
-      t.artist.toLowerCase().includes(q) ||
-      t.album.toLowerCase().includes(q)
-    );
-    renderTrackTable(filtered);
-  });
-
-  // Automatically scan demo directory initially if available
-  try {
-    const tracks = await invoke("scan_music_directory", { dirPath: "demo" });
-    if (tracks && tracks.length > 0) {
-      currentTrackList = tracks;
-      renderTrackTable(currentTrackList);
-    }
-  } catch (_) {}
-}
-
-function renderScanningState() {
-  const tbody = document.getElementById("library-tbody");
-  tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--accent); padding: 30px;">Scanning files with bit-exact metadata parser...</td></tr>`;
-}
+const lib = { q: "", filter: "all", view: "tracks", sortKey: null, sortDir: 1, collapsed: new Set() };
+const isHiRes = (t) => t.bit_depth > 16 || t.sample_rate > 48000;
+const isCD = (t) => t.bit_depth === 16 && t.sample_rate === 44100;
+const sortValue = {
+  title: (t) => t.title.toLowerCase(),
+  artist: (t) => t.artist.toLowerCase(),
+  album: (t) => t.album.toLowerCase(),
+  format: (t) => t.format,
+  quality: (t) => t.bit_depth * 1e6 + t.sample_rate,
+  duration: (t) => t.duration_seconds,
+};
 
 function formatDuration(sec) {
   if (!sec || isNaN(sec)) return "0:00";
   const m = Math.floor(sec / 60);
   const s = Math.floor(sec % 60);
-  return `${m}:${s < 10 ? '0' : ''}${s}`;
+  return `${m}:${s < 10 ? "0" : ""}${s}`;
 }
 
-function renderTrackTable(tracks) {
-  const tbody = document.getElementById("library-tbody");
-  if (!tracks || tracks.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 30px;">No music tracks found in this directory.</td></tr>`;
-    return;
+function renderLibrary() {
+  const tbody = $("library-tbody");
+  const empty = (msg) => { tbody.innerHTML = `<tr><td colspan="7" class="empty">${msg}</td></tr>`; };
+  if (!currentTrackList.length) return empty("No tracks yet. Enter a folder and press Scan.");
+
+  // rows keep their index into currentTrackList, so sorting/filtering never changes what plays
+  let rows = currentTrackList.map((t, i) => ({ t, i }));
+  const q = lib.q.trim().toLowerCase();
+  if (q) rows = rows.filter(({ t }) => `${t.title} ${t.artist} ${t.album}`.toLowerCase().includes(q));
+  if (lib.filter === "hires") rows = rows.filter(({ t }) => isHiRes(t));
+  if (lib.filter === "cd") rows = rows.filter(({ t }) => isCD(t));
+  if (lib.sortKey) {
+    const f = sortValue[lib.sortKey];
+    rows.sort((a, b) => (f(a.t) > f(b.t) ? 1 : f(a.t) < f(b.t) ? -1 : 0) * lib.sortDir);
   }
+  if (!rows.length) return empty("Nothing matches.");
 
-  tbody.innerHTML = tracks.map((t, idx) => `
-    <tr class="track-row ${currentTrackIndex === idx ? 'playing' : ''}" data-index="${idx}">
-      <td style="color: var(--text-muted); font-size: 0.75rem;">${idx + 1}</td>
-      <td style="font-weight: 600;">${t.title}</td>
-      <td style="color: var(--text-secondary);">${t.artist}</td>
-      <td style="color: var(--text-muted);">${t.album}</td>
-      <td><span class="badge highlight">${t.format}</span></td>
-      <td style="font-family: monospace; font-size: 0.75rem;">${t.bit_depth}-bit / ${(t.sample_rate / 1000).toFixed(1)}k</td>
-      <td style="text-align: right; font-family: monospace; color: var(--text-muted);">${formatDuration(t.duration_seconds)}</td>
-    </tr>
-  `).join("");
+  const row = ({ t, i }, n) => `
+    <tr class="track-row ${i === currentTrackIndex ? "playing" : ""}" data-index="${i}" tabindex="0">
+      <td class="n">${n}</td>
+      <td>${esc(t.title)}</td>
+      <td class="dim">${esc(t.artist)}</td>
+      <td class="dim">${esc(t.album)}</td>
+      <td class="f dim">${esc(t.format)}</td>
+      <td class="r">${t.bit_depth}/${+(t.sample_rate / 1000).toFixed(1)}</td>
+      <td class="r">${formatDuration(t.duration_seconds)}</td>
+    </tr>`;
 
-  document.querySelectorAll(".track-row").forEach(row => {
-    row.addEventListener("click", () => {
-      const idx = parseInt(row.getAttribute("data-index"), 10);
-      playTrackByIndex(idx);
+  if (lib.view === "albums") {
+    const groups = new Map();
+    rows.forEach((r) => {
+      const key = `${r.t.album}\u0000${r.t.artist}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(r);
     });
-  });
+    tbody.innerHTML = [...groups].map(([key, g]) => {
+      const mins = Math.round(g.reduce((s, r) => s + r.t.duration_seconds, 0) / 60);
+      const head = `
+        <tr class="group" data-group="${esc(key)}">
+          <td colspan="7">${lib.collapsed.has(key) ? "+" : "−"} ${esc(g[0].t.album)}
+            <span class="g-meta">${esc(g[0].t.artist)} · ${g.length} ${g.length === 1 ? "track" : "tracks"} · ${mins} min</span></td>
+        </tr>`;
+      return head + (lib.collapsed.has(key) ? "" : g.map((r, n) => row(r, n + 1)).join(""));
+    }).join("");
+  } else {
+    tbody.innerHTML = rows.map((r, n) => row(r, n + 1)).join("");
+  }
 }
 
-// =====================================================================
-// Playback Engine & Polling
-// =====================================================================
-async function playTrackByIndex(idx) {
-  if (idx < 0 || idx >= currentTrackList.length) return;
-  currentTrackIndex = idx;
-  if (orderFor !== currentTrackList || !order.length) buildOrder(idx);
-  const track = currentTrackList[idx];
-
-  renderTrackTable(currentTrackList);
-  renderUpNext();
-  loadCover(track.file_path);
-
+async function scan(dir) {
+  $("library-tbody").innerHTML = '<tr><td colspan="7" class="empty">Scanning…</td></tr>';
+  const playingPath = currentTrackList[currentTrackIndex]?.file_path;
   try {
-    await invoke("play_track", {
-      filePath: track.file_path,
-      deviceId: currentDeviceId,
+    currentTrackList = (await invoke("scan_music_directory", { dirPath: dir })) || [];
+  } catch (_) {
+    currentTrackList = [];
+  }
+  // keep the queue pointing at whatever is playing
+  currentTrackIndex = playingPath ? currentTrackList.findIndex((t) => t.file_path === playingPath) : -1;
+  buildOrder(currentTrackIndex >= 0 ? currentTrackIndex : undefined);
+  if (currentTrackIndex >= 0) renderUpNext();
+  renderLibrary();
+}
+
+async function initLibrary() {
+  const scanInput = $("scan-path-input");
+  const savedDir = store.get("scanDir", "");
+
+  try { scanInput.value = savedDir || (await invoke("get_default_music_dir")); } catch (_) {}
+
+  const scanNow = () => {
+    const dir = scanInput.value.trim();
+    if (!dir) return;
+    store.set("scanDir", dir);
+    scan(dir);
+  };
+  $("scan-folder-btn").addEventListener("click", scanNow);
+  scanInput.addEventListener("keydown", (e) => { if (e.key === "Enter") scanNow(); });
+  $("scan-demo-btn").addEventListener("click", () => scan("demo"));
+
+  $("library-search").addEventListener("input", (e) => { lib.q = e.target.value; renderLibrary(); });
+
+  const segment = (id, attr, onPick) => {
+    const box = $(id);
+    box.addEventListener("click", (e) => {
+      const b = e.target.closest("button");
+      if (!b) return;
+      box.querySelectorAll("button").forEach((x) => x.classList.toggle("on", x === b));
+      onPick(b.dataset[attr]);
     });
-    isPlaying = true;
-    isPaused = false;
-    updatePlayPauseButton();
-  } catch (err) {
-    console.error("Playback error:", err);
+  };
+  segment("lib-filter", "filter", (v) => { lib.filter = v; renderLibrary(); });
+  segment("lib-view", "view", (v) => { lib.view = v; renderLibrary(); });
+
+  document.querySelector(".tracks thead").addEventListener("click", (e) => {
+    const th = e.target.closest("th[data-sort]");
+    if (!th) return;
+    lib.sortDir = lib.sortKey === th.dataset.sort ? -lib.sortDir : 1;
+    lib.sortKey = th.dataset.sort;
+    document.querySelectorAll(".tracks th[data-sort]").forEach((h) =>
+      h.setAttribute("aria-sort", h === th ? (lib.sortDir === 1 ? "ascending" : "descending") : "none"));
+    renderLibrary();
+  });
+
+  const tbody = $("library-tbody");
+  const activate = (e) => {
+    const g = e.target.closest("tr.group");
+    if (g) {
+      const k = g.dataset.group;
+      lib.collapsed.has(k) ? lib.collapsed.delete(k) : lib.collapsed.add(k);
+      return renderLibrary();
+    }
+    const r = e.target.closest("tr.track-row");
+    if (r) playTrackByIndex(Number(r.dataset.index));
+  };
+  tbody.addEventListener("click", activate);
+  tbody.addEventListener("keydown", (e) => { if (e.key === "Enter") activate(e); });
+
+  // open with the last folder, or the bundled demo files on first run
+  if (savedDir) scan(savedDir);
+  else {
+    try {
+      const tracks = await invoke("scan_music_directory", { dirPath: "demo" });
+      if (tracks?.length) { currentTrackList = tracks; renderLibrary(); }
+    } catch (_) {}
   }
 }
 
-const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-
-// ---- Queue order: shuffle / repeat ----
-let shuffleOn = false, repeatMode = "off"; // off | all | one
-try {
-  shuffleOn = localStorage.getItem("shuffle") === "1";
-  repeatMode = localStorage.getItem("repeat") || "off";
-} catch (_) {}
+// =====================================================================
+// Queue: shuffle / repeat
+// =====================================================================
+let shuffleOn = store.get("shuffle", "0") === "1";
+let repeatMode = store.get("repeat", "off"); // off | all | one
 let order = [], orderFor = null;
 
 function buildOrder(first) {
@@ -335,8 +338,8 @@ function nextIndex(auto) {
 }
 
 function renderUpNext() {
-  const box = document.getElementById("up-next-list");
-  const sum = document.getElementById("up-next-summary");
+  const box = $("up-next-list");
+  const sum = $("up-next-summary");
   const pos = orderPos();
   const upcoming = pos >= 0 ? order.slice(pos + 1) : [];
   const cur = currentTrackList[currentTrackIndex];
@@ -347,25 +350,27 @@ function renderUpNext() {
 
   const row = (t, idx, label, cls = "") => `
     <div class="up-next-row ${cls}" data-index="${idx}">
-      <span class="un-idx"><span class="un-num">${label}</span><span class="un-play">▶</span></span>
+      <span class="un-idx"><span class="un-num">${label}</span><span class="un-play"></span></span>
       <span class="un-main"><span class="un-title">${esc(t.title)}</span><span class="un-artist">${esc(t.artist)}</span></span>
       <span class="un-dur">${formatDuration(t.duration_seconds)}</span>
     </div>`;
 
-  box.innerHTML = row(cur, currentTrackIndex, "♪", "now") +
+  box.innerHTML = row(cur, currentTrackIndex, "now", "now") +
     upcoming.slice(0, 8).map((idx, i) => row(currentTrackList[idx], idx, i + 1)).join("") +
     (upcoming.length ? "" : '<p class="up-next-empty">End of queue.</p>');
   box.querySelectorAll(".up-next-row:not(.now)").forEach((r) =>
     r.addEventListener("click", () => playTrackByIndex(Number(r.dataset.index))));
 }
 
-// Cover art: shown as disc label, or as a square cover (toggle by clicking the artwork)
+// =====================================================================
+// Cover art: disc label, or square cover (click the artwork to switch)
+// =====================================================================
 async function loadCover(filePath) {
   let url = null;
   try { url = await invoke("get_cover", { filePath }); } catch (_) {}
-  const img = document.getElementById("cover-img");
+  const img = $("cover-img");
   const center = document.querySelector(".vinyl-center");
-  const wrap = document.getElementById("art-wrapper");
+  const wrap = $("art-wrapper");
   img.hidden = !url;
   if (url) img.src = url;
   center.style.backgroundImage = url ? `url("${url}")` : "";
@@ -374,172 +379,234 @@ async function loadCover(filePath) {
 }
 
 function initArtToggle() {
-  const wrap = document.getElementById("art-wrapper");
-  const apply = (square) => {
-    wrap.classList.toggle("square", square);
-  };
-  let square = false;
-  try { square = localStorage.getItem("artSquare") === "1"; } catch (_) {}
-  apply(square);
+  const wrap = $("art-wrapper");
+  wrap.classList.toggle("square", store.get("artSquare", "0") === "1");
   wrap.addEventListener("click", () => {
     if (!wrap.classList.contains("has-cover")) return; // nothing to show as a square
-    square = !wrap.classList.contains("square");
-    apply(square);
-    try { localStorage.setItem("artSquare", square ? "1" : "0"); } catch (_) {}
+    const square = wrap.classList.toggle("square");
+    store.set("artSquare", square ? "1" : "0");
   });
 }
 
-function initPlaybackControls() {
-  const playBtn = document.getElementById("btn-play");
-  const stopBtn = document.getElementById("btn-stop");
-  const prevBtn = document.getElementById("btn-prev");
-  const nextBtn = document.getElementById("btn-next");
-  const progressBar = document.getElementById("progress-bar");
+// =====================================================================
+// Playback
+// =====================================================================
+async function playTrackByIndex(idx) {
+  if (idx < 0 || idx >= currentTrackList.length) return;
+  currentTrackIndex = idx;
+  if (orderFor !== currentTrackList || !order.length) buildOrder(idx);
+  const track = currentTrackList[idx];
 
-  playBtn.addEventListener("click", async () => {
-    if (!isPlaying && currentTrackList.length > 0) {
-      playTrackByIndex(currentTrackIndex >= 0 ? currentTrackIndex : 0);
-    } else if (isPlaying && !isPaused) {
-      await invoke("pause_track");
-      isPaused = true;
-      updatePlayPauseButton();
-    } else if (isPlaying && isPaused) {
-      await invoke("resume_track");
-      isPaused = false;
-      updatePlayPauseButton();
-    }
-  });
+  renderLibrary();
+  renderUpNext();
+  loadCover(track.file_path);
 
-  stopBtn.addEventListener("click", async () => {
-    await invoke("stop_track");
-    isPlaying = false;
+  try {
+    await invoke("play_track", { filePath: track.file_path, deviceId: currentDeviceId });
+    isPlaying = true;
     isPaused = false;
     updatePlayPauseButton();
-    resetNowPlayingUI();
-  });
+  } catch (err) {
+    console.error("Playback error:", err);
+  }
+}
 
-  prevBtn.addEventListener("click", () => {
-    const pos = orderPos();
-    if (currentPosition > 3 || pos <= 0) {
-      invoke("seek_track", { positionSeconds: 0 }); // restart current track
-    } else {
-      playTrackByIndex(order[pos - 1]);
-    }
-  });
+async function togglePlay() {
+  if (!isPlaying && currentTrackList.length > 0) {
+    playTrackByIndex(currentTrackIndex >= 0 ? currentTrackIndex : 0);
+  } else if (isPlaying && !isPaused) {
+    await invoke("pause_track");
+    isPaused = true;
+    updatePlayPauseButton();
+  } else if (isPlaying && isPaused) {
+    await invoke("resume_track");
+    isPaused = false;
+    updatePlayPauseButton();
+  }
+}
 
-  nextBtn.addEventListener("click", () => {
-    const n = nextIndex(false);
-    if (n >= 0) playTrackByIndex(n);
-  });
+async function stopPlayback() {
+  await invoke("stop_track");
+  isPlaying = false;
+  isPaused = false;
+  updatePlayPauseButton();
+  resetNowPlayingUI();
+}
 
-  // Shuffle / repeat toggles
-  const shuffleBtn = document.getElementById("btn-shuffle");
-  const repeatBtn = document.getElementById("btn-repeat");
-  const paintModes = () => {
-    shuffleBtn.classList.toggle("on", shuffleOn);
-    repeatBtn.classList.toggle("on", repeatMode !== "off");
-    repeatBtn.textContent = repeatMode === "one" ? "↻¹" : "↻";
-    repeatBtn.title = `Repeat: ${repeatMode}`;
-  };
-  shuffleBtn.addEventListener("click", () => {
-    shuffleOn = !shuffleOn;
-    try { localStorage.setItem("shuffle", shuffleOn ? "1" : "0"); } catch (_) {}
-    if (currentTrackIndex >= 0) { buildOrder(currentTrackIndex); renderUpNext(); }
-    paintModes();
-  });
-  repeatBtn.addEventListener("click", () => {
-    repeatMode = { off: "all", all: "one", one: "off" }[repeatMode];
-    try { localStorage.setItem("repeat", repeatMode); } catch (_) {}
-    paintModes();
-  });
+function prevTrack() {
+  const pos = orderPos();
+  if (currentPosition > 3 || pos <= 0) {
+    seekTo(0); // restart current track
+  } else {
+    playTrackByIndex(order[pos - 1]);
+  }
+}
+
+function nextTrack() {
+  const n = nextIndex(false);
+  if (n >= 0) playTrackByIndex(n);
+}
+
+function paintModes() {
+  $("btn-shuffle").classList.toggle("on", shuffleOn);
+  const rep = $("btn-repeat");
+  rep.classList.toggle("on", repeatMode !== "off");
+  rep.dataset.mode = repeatMode;
+  rep.title = `Repeat: ${repeatMode} (r)`;
+}
+
+function toggleShuffle() {
+  shuffleOn = !shuffleOn;
+  store.set("shuffle", shuffleOn ? "1" : "0");
+  if (currentTrackIndex >= 0) { buildOrder(currentTrackIndex); renderUpNext(); }
+  paintModes();
+}
+
+function cycleRepeat() {
+  repeatMode = { off: "all", all: "one", one: "off" }[repeatMode];
+  store.set("repeat", repeatMode);
+  paintModes();
+}
+
+// Seeking. The UI position is extrapolated between 250ms polls, so seeks update it immediately.
+let lastPollPos = 0, lastPollAt = 0, lastTimeText = "", lastSeekAt = 0;
+const livePos = () => lastPollPos + (isPaused ? 0 : (performance.now() - lastPollAt) / 1000);
+
+function seekTo(seconds) {
+  if (isPaused) return; // the engine ignores seeks while paused
+  lastSeekAt = performance.now();
+  lastPollPos = seconds;
+  lastPollAt = lastSeekAt;
+  return invoke("seek_track", { positionSeconds: seconds });
+}
+
+function seekBy(delta) {
+  if (!currentDuration) return;
+  seekTo(Math.max(0, Math.min(currentDuration - 0.5, livePos() + delta)));
+}
+
+function initPlaybackControls() {
+  $("btn-play").addEventListener("click", togglePlay);
+  $("btn-stop").addEventListener("click", stopPlayback);
+  $("btn-prev").addEventListener("click", prevTrack);
+  $("btn-next").addEventListener("click", nextTrack);
+  $("btn-shuffle").addEventListener("click", toggleShuffle);
+  $("btn-repeat").addEventListener("click", cycleRepeat);
   paintModes();
 
-  // Seeking on progress bar
-  progressBar.addEventListener("click", async (e) => {
+  const bar = $("progress-bar");
+  bar.addEventListener("click", (e) => {
     if (!currentDuration) return;
-    const rect = progressBar.getBoundingClientRect();
-    const clickX = e.clientX - rect.left;
-    const fraction = Math.max(0, Math.min(1, clickX / rect.width));
-    const targetSeconds = fraction * currentDuration;
-
-    lastSeekAt = performance.now();
-    lastPollPos = targetSeconds; // bar jumps instantly
-    lastPollAt = lastSeekAt;
-    await invoke("seek_track", { positionSeconds: targetSeconds });
-  });
-
-  // Quick device select
-  document.getElementById("quick-device-select").addEventListener("change", (e) => {
-    currentDeviceId = e.target.value;
-    loadAudioDevices();
+    const rect = bar.getBoundingClientRect();
+    seekTo(Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) * currentDuration);
   });
 }
 
 function updatePlayPauseButton() {
-  const btn = document.getElementById("btn-play");
-  const vinyl = document.getElementById("vinyl-disc");
+  const playing = isPlaying && !isPaused;
+  $("btn-play").classList.toggle("is-playing", playing);
+  $("vinyl-disc").classList.toggle("spinning", playing);
+}
 
-  if (isPlaying && !isPaused) {
-    btn.textContent = "⏸";
-    vinyl.classList.add("spinning");
-  } else {
-    btn.textContent = "▶";
-    vinyl.classList.remove("spinning");
-  }
+// =====================================================================
+// Readout (Now playing) + transport status
+// =====================================================================
+const READOUT = ["source", "output", "rate", "format", "buffer", "resample", "mixer"];
+const setReadout = (vals) => READOUT.forEach((k, i) => { $(`ro-${k}`).textContent = vals ? vals[i] : "—"; });
+
+function setIdleStatus() {
+  $("signal-dot").className = "mark";
+  $("signal-hud-text").textContent = "Idle";
+  $("tp-rate").textContent = "—";
+  setReadout(null);
 }
 
 function resetNowPlayingUI() {
-  document.getElementById("time-current").textContent = "0:00";
-  document.getElementById("progress-fill").style.width = "0%";
-  document.getElementById("signal-dot").classList.remove("active");
-  document.getElementById("signal-hud-text").textContent = "Signal Path: Idle";
+  $("time-current").textContent = "0:00";
+  $("progress-fill").style.width = "0%";
+  setIdleStatus();
 }
 
-let endedHandled = false;
-let lastSeekAt = 0;
+function showStatus(s) {
+  const k = (n) => +(n / 1000).toFixed(1);
+  const hz = s.active_hardware_rate;
+  const fmt = (s.active_hardware_format || "").replace(/\s*\(.*\)/, "");
+  const ms = (frames) => (hz ? Math.round((frames / hz) * 1000) : 0);
+  const src = `${(s.file_path || "").split(".").pop().toUpperCase()} ${s.bit_depth}-bit / ${k(s.sample_rate)} kHz / ${s.channels === 1 ? "mono" : "stereo"}`;
+  const resample = s.is_bit_perfect ? "none" : s.sample_rate !== hz ? `${k(s.sample_rate)} → ${k(hz)} kHz` : "possible (shared device)";
 
-// Volume: DAC hardware mixer through ALSA (disabled for non-hw devices, where it would not be bit-perfect)
+  setReadout([
+    src,
+    s.active_device_id,
+    `${hz} Hz`,
+    fmt,
+    s.active_buffer_frames ? `${ms(s.active_buffer_frames)} ms / ${ms(s.active_period_frames)} ms` : "—",
+    resample,
+    $("volume-slider").disabled ? "system" : "DAC hardware",
+  ]);
+  $("tp-rate").textContent = `${k(hz)} kHz · ${fmt}`;
+  $("signal-dot").className = `mark ${s.is_bit_perfect ? "ok" : "warn"}`;
+  $("signal-hud-text").textContent = s.is_bit_perfect ? "Bit-perfect · direct hardware" : `Not bit-perfect · ${s.active_device_id}`;
+}
+
+// =====================================================================
+// Volume: DAC hardware mixer (disabled for shared devices, where it would not be bit-perfect)
+// =====================================================================
 async function refreshVolume() {
-  const slider = document.getElementById("volume-slider");
-  const label = document.getElementById("vol-label");
-  const v = await invoke("get_volume", { deviceId: currentDeviceId });
+  const slider = $("volume-slider");
+  let v = null;
+  try { v = await invoke("get_volume", { deviceId: currentDeviceId }); } catch (_) {}
   slider.disabled = v === null;
   slider.title = v === null ? "No hardware volume for this device" : "";
   if (v !== null) slider.value = v;
-  label.textContent = v === null ? "--" : `${v}%`;
-}
-function initVolume() {
-  const slider = document.getElementById("volume-slider");
-  slider.addEventListener("input", () => {
-    document.getElementById("vol-label").textContent = `${slider.value}%`;
-    invoke("set_volume", { deviceId: currentDeviceId, percent: Number(slider.value) });
-  });
+  $("vol-label").textContent = v === null ? "--" : `${v}%`;
 }
 
-// Smooth progress: poll gives position every 250ms, so extrapolate each frame
-let lastPollPos = 0, lastPollAt = 0, lastTimeText = "";
+let volTimer;
+function setVolume(pct) {
+  const slider = $("volume-slider");
+  slider.value = pct;
+  $("vol-label").textContent = `${slider.value}%`;
+  // throttle: one mixer call per ~60ms, not one per slider pixel
+  clearTimeout(volTimer);
+  volTimer = setTimeout(() => invoke("set_volume", { deviceId: currentDeviceId, percent: Number(slider.value) }), 60);
+}
+
+function initVolume() {
+  const slider = $("volume-slider");
+  slider.addEventListener("input", () => setVolume(Number(slider.value)));
+}
+
+function nudgeVolume(delta) {
+  const slider = $("volume-slider");
+  if (!slider.disabled) setVolume(Math.max(0, Math.min(100, Number(slider.value) + delta)));
+}
+
+// =====================================================================
+// Smooth progress + status polling
+// =====================================================================
 function animateProgress() {
   if (isPlaying && currentDuration > 0) {
-    const elapsed = isPaused ? 0 : (performance.now() - lastPollAt) / 1000;
-    const pos = Math.min(currentDuration, lastPollPos + elapsed);
-    document.getElementById("progress-fill").style.width = `${(pos / currentDuration) * 100}%`;
+    const pos = Math.min(currentDuration, livePos());
+    $("progress-fill").style.width = `${(pos / currentDuration) * 100}%`;
     const t = formatDuration(pos);
     if (t !== lastTimeText) {
       lastTimeText = t;
-      document.getElementById("time-current").textContent = t;
+      $("time-current").textContent = t;
     }
   }
   requestAnimationFrame(animateProgress);
 }
 
-// Poll engine state every 250ms
+let endedHandled = false;
+
 function startStatusPolling() {
   setInterval(async () => {
     try {
       const status = await invoke("get_playback_status");
       if (!status) return;
 
-      // Autoplay: engine says the track ran to its natural end -> next one
+      // Autoplay: the engine says the track ran to its natural end
       if (status.ended && !endedHandled) {
         endedHandled = true;
         const n = nextIndex(true);
@@ -550,87 +617,125 @@ function startStatusPolling() {
       isPaused = status.is_paused;
       currentDuration = status.duration_seconds;
       currentPosition = status.position_seconds;
-      // right after a seek, ignore polls until the engine has applied it
+
+      // right after a seek, ignore polled positions until the engine has applied it
       if (performance.now() - lastSeekAt > 400) {
+        lastPollPos = currentPosition;
+        lastPollAt = performance.now();
       }
 
       updatePlayPauseButton();
 
-      if (isPlaying) {
-        // Update seekbar
-        lastPollPos = currentPosition;
-        lastPollAt = performance.now();
-        document.getElementById("time-duration").textContent = formatDuration(currentDuration);
+      if (!isPlaying) return setIdleStatus();
 
-        // Update Now Playing headers
-        document.getElementById("np-title").textContent = status.title;
-        document.getElementById("np-artist").textContent = status.artist;
-        document.getElementById("np-album").textContent = status.album;
-
-        // Mini player
-        document.getElementById("mini-title").textContent = status.title;
-        document.getElementById("mini-artist").textContent = status.artist;
-
-        // Badges
-        document.getElementById("np-badge-bits").textContent = `${status.bit_depth}-bit`;
-        document.getElementById("np-badge-rate").textContent = `${(status.sample_rate / 1000).toFixed(1)} kHz`;
-        document.getElementById("np-badge-channels").textContent = status.channels === 1 ? "Mono" : "Stereo";
-
-        // Signal HUD & Bit-Perfect Badge
-        const signalDot = document.getElementById("signal-dot");
-        const signalHudText = document.getElementById("signal-hud-text");
-        const signalChain = document.getElementById("np-signal-chain");
-
-        signalDot.classList.add("active");
-
-        const srcRateK = (status.sample_rate / 1000).toFixed(1);
-        const hwRateK = (status.active_hardware_rate / 1000).toFixed(1);
-
-        if (status.is_bit_perfect) {
-          signalHudText.textContent = `⚡ Bit-Perfect Direct ALSA (${hwRateK} kHz · ${status.active_hardware_format} · 0 Resampling)`;
-          signalChain.textContent = `Source [${status.bit_depth}b/${srcRateK}k] ➔ rex-music [Bit-Exact Pipeline] ➔ DAC [${status.active_device_id} @ ${hwRateK}kHz · ${status.active_hardware_format}] (Zero DSP)`;
-          signalDot.style.backgroundColor = "var(--accent)";
-          signalDot.style.boxShadow = "0 0 10px var(--accent)";
-        } else {
-          signalHudText.textContent = `⚠️ Fallback: ${status.active_device_id} (DAC locked at ${hwRateK} kHz)`;
-          signalChain.textContent = `Source [${status.bit_depth}b/${srcRateK}k] ➔ System Mixer ➔ DAC [${status.active_device_id}] (WirePlumber holding device)`;
-          signalDot.style.backgroundColor = "#ff5555";
-          signalDot.style.boxShadow = "0 0 10px #ff5555";
-        }
-      } else {
-        document.getElementById("signal-dot").classList.remove("active");
-        document.getElementById("signal-hud-text").textContent = "Signal Path: Idle";
-      }
+      $("time-duration").textContent = formatDuration(currentDuration);
+      $("np-title").textContent = status.title;
+      $("np-artist").textContent = status.artist;
+      $("np-album").textContent = status.album;
+      $("mini-title").textContent = status.title;
+      $("mini-artist").textContent = status.artist;
+      showStatus(status);
     } catch (_) {}
   }, 250);
 }
 
-// Engine log panel: poll backend buffer, re-render only when it changes
-let lastLogCount = -1;
+// =====================================================================
+// Terminal
+// =====================================================================
+let allLogs = [], logSig = "";
+const logLevels = new Set(["info", "alsa", "warn", "error"]);
+const visibleLogs = () => allLogs.filter((l) => logLevels.has(l.level.toLowerCase()));
+
+function renderLogs() {
+  const out = $("log-output");
+  const stick = out.scrollTop + out.clientHeight >= out.scrollHeight - 20;
+  out.replaceChildren(...visibleLogs().map((l) => {
+    const div = document.createElement("div");
+    div.className = `log-line ${l.level.toLowerCase()}`;
+    const t = document.createElement("span");
+    t.className = "log-time";
+    t.textContent = l.timestamp;
+    div.append(t, document.createTextNode(`[${l.level}] ${l.message}`));
+    return div;
+  }));
+  if (stick) out.scrollTop = out.scrollHeight;
+}
+
 function initLogPanel() {
-  const out = document.getElementById("log-output");
-  document.getElementById("clear-logs-btn").addEventListener("click", async () => {
+  $("clear-logs-btn").addEventListener("click", async () => {
     await invoke("clear_engine_logs");
-    lastLogCount = -1;
+    allLogs = [];
+    logSig = "";
+    renderLogs();
   });
+
+  $("copy-logs-btn").addEventListener("click", async (e) => {
+    const text = visibleLogs().map((l) => `${l.timestamp} [${l.level}] ${l.message}`).join("\n");
+    const btn = e.currentTarget;
+    try {
+      await navigator.clipboard.writeText(text);
+      btn.textContent = "Copied";
+    } catch (_) {
+      btn.textContent = "Copy failed";
+    }
+    setTimeout(() => { btn.textContent = "Copy"; }, 1200);
+  });
+
+  $("log-filter").addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    const on = b.classList.toggle("on");
+    on ? logLevels.add(b.dataset.level) : logLevels.delete(b.dataset.level);
+    renderLogs();
+  });
+
   setInterval(async () => {
     try {
       const logs = await invoke("get_engine_logs");
-      if (logs.length === lastLogCount) return;
-      lastLogCount = logs.length;
-      const stick = out.scrollTop + out.clientHeight >= out.scrollHeight - 20;
-      out.replaceChildren(...logs.map((l) => {
-        const div = document.createElement("div");
-        div.className = `log-line ${l.level.toLowerCase()}`;
-        const t = document.createElement("span");
-        t.className = "log-time";
-        t.textContent = l.timestamp;
-        div.append(t, document.createTextNode(`[${l.level}] ${l.message}`));
-        return div;
-      }));
-      if (stick) out.scrollTop = out.scrollHeight;
-    } catch (e) { /* backend not ready */ }
+      const last = logs[logs.length - 1];
+      const sig = `${logs.length}|${last?.timestamp}|${last?.message}`;
+      if (sig === logSig) return;
+      logSig = sig;
+      allLogs = logs;
+      renderLogs();
+    } catch (_) { /* backend not ready */ }
   }, 500);
+}
+
+// =====================================================================
+// Keyboard
+// =====================================================================
+function initShortcuts() {
+  const dlg = $("shortcuts");
+  $("help-btn").addEventListener("click", () => dlg.showModal());
+
+  const typing = (el) => el.matches?.("input:not([type=range]):not([type=color]), textarea, select");
+
+  // Space activates a focused button on keyup; swallow it so it only toggles playback once
+  addEventListener("keyup", (e) => { if (e.key === " " && !typing(e.target)) e.preventDefault(); });
+
+  addEventListener("keydown", (e) => {
+    if (e.ctrlKey || e.metaKey || e.altKey || dlg.open) return;
+    if (typing(e.target)) { if (e.key === "Escape") e.target.blur(); return; }
+    if (e.target.type === "range") return; // the volume slider handles its own arrows
+
+    const actions = {
+      " ": togglePlay,
+      ArrowLeft: () => seekBy(-5),
+      ArrowRight: () => seekBy(5),
+      ArrowUp: () => nudgeVolume(5),
+      ArrowDown: () => nudgeVolume(-5),
+      n: nextTrack,
+      p: prevTrack,
+      s: toggleShuffle,
+      r: cycleRepeat,
+      "/": () => { showView("library"); $("library-search").focus(); },
+      "?": () => dlg.showModal(),
+    };
+    const act = actions[e.key];
+    if (act) { e.preventDefault(); act(); }
+    else if (e.key >= "1" && e.key <= "5") { e.preventDefault(); showView(VIEWS[Number(e.key) - 1]); }
+  });
 }
 
 // =====================================================================
@@ -639,12 +744,14 @@ function initLogPanel() {
 window.addEventListener("DOMContentLoaded", () => {
   initNavigation();
   initThemeEngine();
+  initDevices();
   loadAudioDevices();
   initLibrary();
   initPlaybackControls();
-  startStatusPolling();
   initVolume();
   initArtToggle();
-  requestAnimationFrame(animateProgress);
   initLogPanel();
+  initShortcuts();
+  startStatusPolling();
+  requestAnimationFrame(animateProgress);
 });

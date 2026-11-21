@@ -16,57 +16,57 @@ struct AppState {
     cached_library: Mutex<Vec<TrackInfo>>,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn list_audio_devices() -> Vec<AudioDevice> {
     get_audio_devices()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn play_track(state: State<'_, AppState>, file_path: String, device_id: String) {
     state.engine.play(file_path, device_id);
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn set_volume(device_id: String, percent: u32) -> bool {
     audio_engine::set_hw_volume(&device_id, percent)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_volume(device_id: String) -> Option<u32> {
     audio_engine::get_hw_volume(&device_id)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_cover(file_path: String) -> Option<String> {
     library::get_cover(&file_path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn pause_track(state: State<'_, AppState>) {
     state.engine.pause();
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn resume_track(state: State<'_, AppState>) {
     state.engine.resume();
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn stop_track(state: State<'_, AppState>) {
     state.engine.stop();
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn seek_track(state: State<'_, AppState>, position_seconds: f64) {
     state.engine.seek(position_seconds);
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_playback_status(state: State<'_, AppState>) -> PlaybackStatus {
     state.engine.get_status()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn scan_music_directory(state: State<'_, AppState>, dir_path: Option<String>) -> Vec<TrackInfo> {
     let target_dir = dir_path.unwrap_or_else(|| {
         std::env::var("HOME")
@@ -81,24 +81,24 @@ fn scan_music_directory(state: State<'_, AppState>, dir_path: Option<String>) ->
     tracks
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_default_music_dir() -> String {
     std::env::var("HOME")
         .map(|h| format!("{}/Music", h))
         .unwrap_or_else(|_| ".".into())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_engine_logs() -> Vec<LogEntry> {
     get_logs()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn clear_engine_logs() {
     clear_logs();
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn get_kernel_hw_params() -> String {
     let mut out = String::new();
     for i in 0..5 {
@@ -144,6 +144,11 @@ pub fn run() {
             clear_engine_logs,
             get_kernel_hw_params,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_, event| {
+            if let tauri::RunEvent::Exit = event {
+                audio_engine::release_device_to_pipewire();
+            }
+        });
 }

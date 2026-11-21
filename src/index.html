@@ -2,283 +2,243 @@
 <html lang="en" data-theme="oled">
   <head>
     <meta charset="UTF-8" />
-    <link rel="stylesheet" href="styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>rex-music</title>
+    <link rel="stylesheet" href="styles.css" />
     <script type="module" src="/main.js" defer></script>
   </head>
 
   <body>
-    <!-- Topbar & Signal Path HUD -->
-    <header class="topbar">
-      <div class="brand">
-        <span class="brand-logo">rex-music</span>
-      </div>
-
-      <div class="signal-hud" id="signal-hud">
-        <div class="signal-dot" id="signal-dot"></div>
-        <span class="signal-text" id="signal-hud-text">Signal Path: Idle</span>
-      </div>
-
-      <div class="topbar-controls">
-        <select id="quick-device-select" class="select-input" title="Output Audio Device">
-          <option value="default">Default System Audio</option>
+    <header class="top">
+      <span class="brand">rex-music</span>
+      <label class="out">
+        <span>Output</span>
+        <select id="quick-device-select" class="select-input" aria-label="Output device">
+          <option value="default">Default</option>
         </select>
-
-        <select id="quick-theme-select" class="select-input" title="Theme Selector">
-          <option value="oled">OLED Pure Black</option>
-          <option value="hifi">Studio Hi-Fi (Amber)</option>
-          <option value="cyberpunk">Cyberpunk Neon</option>
-          <option value="nord">Nordic Slate</option>
-          <option value="gruvbox">Gruvbox Dark</option>
-          <option value="snow">Minimalist Snow</option>
-        </select>
-      </div>
+      </label>
     </header>
 
-    <!-- Main Workspace -->
-    <div class="app-body">
-      <!-- Sidebar Navigation -->
-      <nav class="sidebar">
-        <div class="nav-item active" data-view="now-playing">
-          <span>🎵</span> Now Playing
-        </div>
-        <div class="nav-item" data-view="library">
-          <span>📚</span> Music Library
-        </div>
-        <div class="nav-item" data-view="hardware">
-          <span>🎛️</span> Audio & DAC
-        </div>
-        <div class="nav-item" data-view="themes">
-          <span>🎨</span> Themes
-        </div>
-        <div class="nav-item" data-view="terminal">
-          <span>🖥️</span> Terminal
-        </div>
+    <div class="shell">
+      <nav class="rail" aria-label="Views">
+        <button class="nav-item active" data-view="now-playing">Now playing <kbd>1</kbd></button>
+        <button class="nav-item" data-view="library">Library <kbd>2</kbd></button>
+        <button class="nav-item" data-view="hardware">Output <kbd>3</kbd></button>
+        <button class="nav-item" data-view="themes">Themes <kbd>4</kbd></button>
+        <button class="nav-item" data-view="terminal">Terminal <kbd>5</kbd></button>
+        <button class="rail-help" id="help-btn">Shortcuts <kbd>?</kbd></button>
       </nav>
 
-      <!-- Main Dynamic Content Views -->
-      <main class="main-content">
-        <!-- VIEW 1: Now Playing -->
+      <main class="stage">
+        <!-- Now playing -->
         <section id="now-playing-view" class="view-section active">
-          <div class="now-playing-container">
-            <div class="vinyl-wrapper" id="art-wrapper" title="Click to switch disc / square cover">
-              <img id="cover-img" alt="" hidden>
-              <div class="vinyl-record" id="vinyl-disc">
-                <div class="vinyl-center">
-                  <span>rex-music</span>
-                  <span id="vinyl-rate">BIT-PERFECT</span>
-                </div>
+          <div class="np">
+            <div class="art" id="art-wrapper" title="Click to switch between disc and cover">
+              <img id="cover-img" alt="Album cover" hidden />
+              <div class="disc" id="vinyl-disc">
+                <div class="vinyl-center"><span>rex-music</span></div>
               </div>
             </div>
 
-            <div class="now-playing-info">
-              <div>
-                <h1 class="track-title" id="np-title">No Track Selected</h1>
-                <p class="track-artist" id="np-artist">Select a track from the Music Library</p>
-                <p class="track-album" id="np-album"></p>
-              </div>
+            <div class="np-info">
+              <div class="status"><span class="mark" id="signal-dot"></span><span id="signal-hud-text">Idle</span></div>
+              <h1 class="track-title" id="np-title">Nothing playing</h1>
+              <p class="track-artist" id="np-artist">Pick a track in the library</p>
+              <p class="track-album" id="np-album"></p>
 
-              <div class="spec-badges">
-                <span class="badge highlight" id="np-badge-format">FLAC</span>
-                <span class="badge" id="np-badge-bits">16-bit</span>
-                <span class="badge" id="np-badge-rate">44.1 kHz</span>
-                <span class="badge highlight" id="np-badge-direct">Direct ALSA</span>
-                <span class="badge" id="np-badge-channels">Stereo</span>
-              </div>
-
-              <div class="signal-path-card">
-                <div class="signal-path-title">Bit-Perfect Signal Flow</div>
-                <div class="signal-path-chain" id="np-signal-chain">
-                  Source [Ready] ➔ rex-music [Bit-Exact Direct Pipeline] ➔ DAC [Awaiting Stream]
-                </div>
-              </div>
+              <dl class="readout">
+                <dt>Source</dt><dd id="ro-source">—</dd>
+                <dt>Output</dt><dd id="ro-output">—</dd>
+                <dt>Clock</dt><dd id="ro-rate">—</dd>
+                <dt>Sample format</dt><dd id="ro-format">—</dd>
+                <dt>Buffer / period</dt><dd id="ro-buffer">—</dd>
+                <dt>Resampling</dt><dd id="ro-resample">—</dd>
+                <dt>Volume</dt><dd id="ro-mixer">—</dd>
+              </dl>
             </div>
           </div>
 
-          <div class="up-next">
-            <div class="up-next-head"><div class="signal-path-title">Up Next</div><span id="up-next-summary"></span></div>
-            <div id="up-next-list"><p class="up-next-empty">Play a track from the Music Library to build the queue.</p></div>
+          <div class="queue">
+            <div class="queue-head"><h2>Queue</h2><span id="up-next-summary"></span></div>
+            <div id="up-next-list"><p class="up-next-empty">Empty.</p></div>
           </div>
         </section>
 
-        <!-- VIEW 2: Library -->
+        <!-- Library -->
         <section id="library-view" class="view-section">
-          <div class="library-header">
-            <div>
-              <h2>Local Music Library</h2>
-              <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">
-                Direct hardware streaming of FLAC, WAV, and OGG files.
-              </p>
+          <div class="bar">
+            <input type="search" id="library-search" class="field grow" placeholder="Search title, artist, album  ( / )" />
+            <div class="seg" id="lib-filter" role="group" aria-label="Quality filter">
+              <button data-filter="all" class="on">All</button>
+              <button data-filter="hires">Hi-res</button>
+              <button data-filter="cd">CD</button>
             </div>
-            <div style="display: flex; gap: 10px;">
-              <input type="text" id="library-search" class="search-input" placeholder="Search artist, title, album..." />
-              <button id="scan-folder-btn" class="btn-action">Scan Folder</button>
+            <div class="seg" id="lib-view" role="group" aria-label="Grouping">
+              <button data-view="tracks" class="on">Tracks</button>
+              <button data-view="albums">Albums</button>
             </div>
           </div>
-
-          <div style="margin-bottom: 14px; display: flex; gap: 8px;">
-            <input type="text" id="scan-path-input" class="search-input" style="flex: 1;" placeholder="Directory to scan..." />
-            <button id="scan-demo-btn" class="btn-pill">Scan Demo Songs</button>
+          <div class="bar">
+            <input type="text" id="scan-path-input" class="field grow mono" placeholder="Folder to scan" />
+            <button id="scan-folder-btn" class="btn">Scan</button>
+            <button id="scan-demo-btn" class="btn ghost">Demo files</button>
           </div>
 
-          <table class="track-table">
+          <table class="tracks">
+            <colgroup>
+              <col style="width: 44px" /><col /><col style="width: 22%" /><col style="width: 22%" />
+              <col style="width: 70px" /><col style="width: 90px" /><col style="width: 70px" />
+            </colgroup>
             <thead>
               <tr>
-                <th style="width: 40px;">#</th>
-                <th>Title</th>
-                <th>Artist</th>
-                <th>Album</th>
-                <th>Format</th>
-                <th>Quality</th>
-                <th style="text-align: right;">Duration</th>
+                <th class="num">#</th>
+                <th data-sort="title">Title</th>
+                <th data-sort="artist">Artist</th>
+                <th data-sort="album">Album</th>
+                <th data-sort="format">Format</th>
+                <th data-sort="quality" class="r">Bits / kHz</th>
+                <th data-sort="duration" class="r">Time</th>
               </tr>
             </thead>
             <tbody id="library-tbody">
-              <tr>
-                <td colspan="7" style="text-align: center; color: var(--text-muted); padding: 30px;">
-                  No music loaded yet. Click "Scan Folder" or "Scan Demo Songs" above!
-                </td>
-              </tr>
+              <tr><td colspan="7" class="empty">No tracks yet. Enter a folder and press Scan.</td></tr>
             </tbody>
           </table>
         </section>
 
-        <!-- VIEW 3: Audio Hardware & DAC Setup -->
+        <!-- Output devices -->
         <section id="hardware-view" class="view-section">
-          <div class="library-header">
+          <div class="head">
             <div>
-              <h2>Hardware Audio Endpoints (ALSA)</h2>
-              <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">
-                Direct hardware devices (<code>hw:</code>) bypass all OS mixers and software resampling.
-              </p>
+              <h2>Output devices</h2>
+              <p class="sub">Direct <code>hw:</code> devices skip the system mixer and resampler.</p>
             </div>
-            <button id="rescan-hw-btn" class="btn-action">Scan Soundcards</button>
+            <button id="rescan-hw-btn" class="btn">Rescan</button>
+          </div>
+          <div class="devices" id="hw-devices-grid"><p class="empty">Scanning…</p></div>
+        </section>
+
+        <!-- Themes -->
+        <section id="themes-view" class="view-section">
+          <div class="head">
+            <div>
+              <h2>Themes</h2>
+              <p class="sub">A theme is a handful of CSS variables. Export yours as JSON.</p>
+            </div>
+            <button id="export-theme-btn" class="btn">Export theme.json</button>
           </div>
 
-          <div class="hw-grid" id="hw-devices-grid">
-            <p style="color: var(--text-muted);">Scanning connected DACs and soundcards...</p>
+          <div class="theme-list" id="theme-presets">
+            <button class="theme-card active" data-theme-name="oled">
+              <span class="swatch" data-theme="oled"><i></i><i></i><i></i></span><span class="theme-name">OLED</span>
+            </button>
+            <button class="theme-card" data-theme-name="hifi">
+              <span class="swatch" data-theme="hifi"><i></i><i></i><i></i></span><span class="theme-name">Amber</span>
+            </button>
+            <button class="theme-card" data-theme-name="cyberpunk">
+              <span class="swatch" data-theme="cyberpunk"><i></i><i></i><i></i></span><span class="theme-name">Midnight</span>
+            </button>
+            <button class="theme-card" data-theme-name="nord">
+              <span class="swatch" data-theme="nord"><i></i><i></i><i></i></span><span class="theme-name">Nord</span>
+            </button>
+            <button class="theme-card" data-theme-name="gruvbox">
+              <span class="swatch" data-theme="gruvbox"><i></i><i></i><i></i></span><span class="theme-name">Gruvbox</span>
+            </button>
+            <button class="theme-card" data-theme-name="snow">
+              <span class="swatch" data-theme="snow"><i></i><i></i><i></i></span><span class="theme-name">Paper</span>
+            </button>
+          </div>
+
+          <h3 class="group-label">Customize</h3>
+          <div class="pickers">
+            <label>Background <code>--bg-app</code><input type="color" id="picker-bg-app" value="#000000" /></label>
+            <label>Surface <code>--bg-card</code><input type="color" id="picker-bg-card" value="#0c0c0d" /></label>
+            <label>Accent <code>--accent</code><input type="color" id="picker-accent" value="#3ddc97" /></label>
+            <label>Text <code>--text-primary</code><input type="color" id="picker-text" value="#e8e8e6" /></label>
           </div>
         </section>
 
-        <!-- VIEW 5: Terminal / Engine Log -->
+        <!-- Terminal -->
         <section id="terminal-view" class="view-section">
-          <div class="library-header">
+          <div class="head">
             <div>
               <h2>Terminal</h2>
-              <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">
-                Live engine output: device open results, ALSA errors, fallbacks.
-              </p>
+              <p class="sub">Engine output: device opens, ALSA errors, PipeWire hand-off.</p>
             </div>
-            <button id="clear-logs-btn" class="btn-action">Clear</button>
-          </div>
-          <div class="terminal-box">
-            <div class="terminal-bar">
-              <span class="terminal-title">rex-music · engine output</span>
-            </div>
-            <div id="log-output" class="terminal-output log-output"></div>
-          </div>
-        </section>
-
-        <!-- VIEW 4: Themes & Customizer -->
-        <section id="themes-view" class="view-section">
-          <div class="library-header">
-            <div>
-              <h2>Community Themes & Customizer</h2>
-              <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">
-                rex-music themes are built with simple CSS variables. Click a preset or build your own!
-              </p>
-            </div>
-            <button id="export-theme-btn" class="btn-action">Export theme.json</button>
-          </div>
-
-          <h3 style="font-size: 0.95rem; margin-bottom: 12px; color: var(--text-secondary);">Preset Themes</h3>
-          <div class="theme-presets-grid" id="theme-presets">
-            <div class="theme-card active" data-theme-name="oled">
-              <div class="theme-preview" style="background: #000000; border-bottom: 4px solid #00e699;"></div>
-              <span class="theme-name">OLED Pure Black</span>
-            </div>
-            <div class="theme-card" data-theme-name="hifi">
-              <div class="theme-preview" style="background: #121316; border-bottom: 4px solid #e5a93c;"></div>
-              <span class="theme-name">Studio Hi-Fi</span>
-            </div>
-            <div class="theme-card" data-theme-name="cyberpunk">
-              <div class="theme-preview" style="background: #080914; border-bottom: 4px solid #00f0ff;"></div>
-              <span class="theme-name">Cyberpunk Neon</span>
-            </div>
-            <div class="theme-card" data-theme-name="nord">
-              <div class="theme-preview" style="background: #242933; border-bottom: 4px solid #88c0d0;"></div>
-              <span class="theme-name">Nordic Slate</span>
-            </div>
-            <div class="theme-card" data-theme-name="gruvbox">
-              <div class="theme-preview" style="background: #1d2021; border-bottom: 4px solid #fabd2f;"></div>
-              <span class="theme-name">Gruvbox Dark</span>
-            </div>
-            <div class="theme-card" data-theme-name="snow">
-              <div class="theme-preview" style="background: #ffffff; border-bottom: 4px solid #0070f3;"></div>
-              <span class="theme-name">Minimalist Snow</span>
+            <div class="bar tight">
+              <div class="seg" id="log-filter" role="group" aria-label="Log levels">
+                <button data-level="info" class="on">Info</button>
+                <button data-level="alsa" class="on">ALSA</button>
+                <button data-level="warn" class="on">Warn</button>
+                <button data-level="error" class="on">Error</button>
+              </div>
+              <button id="copy-logs-btn" class="btn ghost">Copy</button>
+              <button id="clear-logs-btn" class="btn ghost">Clear</button>
             </div>
           </div>
-
-          <div class="custom-theme-box">
-            <h3 class="custom-theme-title">Live CSS Theme Customizer</h3>
-            <p style="font-size: 0.78rem; color: var(--text-muted); margin-bottom: 14px;">
-              Tweak these colors live! When you're happy, export it as <code>theme.json</code> to share with the community.
-            </p>
-            <div class="color-input-row">
-              <span>App Background (<code>--bg-app</code>)</span>
-              <input type="color" id="picker-bg-app" value="#000000" />
-            </div>
-            <div class="color-input-row">
-              <span>Card Background (<code>--bg-card</code>)</span>
-              <input type="color" id="picker-bg-card" value="#0f1115" />
-            </div>
-            <div class="color-input-row">
-              <span>Accent & Glow (<code>--accent</code>)</span>
-              <input type="color" id="picker-accent" value="#00e699" />
-            </div>
-            <div class="color-input-row">
-              <span>Primary Text (<code>--text-primary</code>)</span>
-              <input type="color" id="picker-text" value="#f5f7fa" />
-            </div>
-          </div>
+          <div id="log-output" class="terminal-output"></div>
         </section>
       </main>
     </div>
 
-    <!-- Bottom Audio Player Bar -->
-    <footer class="player-bar">
-      <!-- Interactive Scrubber Timeline -->
-      <div class="scrubber-row">
-        <span class="time-label" id="time-current">0:00</span>
-        <div class="progress-track" id="progress-bar">
-          <div class="progress-fill" id="progress-fill"></div>
-        </div>
-        <span class="time-label right" id="time-duration">0:00</span>
+    <footer class="transport">
+      <div class="tp-left">
+        <div class="mini-title" id="mini-title">Nothing playing</div>
+        <div class="mini-artist" id="mini-artist"></div>
       </div>
 
-      <!-- Controls Row -->
-      <div class="controls-row">
-        <div class="mini-track-info">
-          <div class="mini-title" id="mini-title">Idle</div>
-          <div class="mini-artist" id="mini-artist">rex-music</div>
+      <div class="tp-center">
+        <div class="buttons">
+          <button class="ctrl mode" id="btn-shuffle" title="Shuffle (s)" aria-label="Shuffle">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7h3.5c2 0 3.2 1 4.3 2.7l2.4 3.6c1.1 1.7 2.3 2.7 4.3 2.7H21M3 17h3.5c1.4 0 2.4-.5 3.3-1.4M13.2 8.3C14 7.5 15 7 16.5 7H21M18 4l3 3-3 3M18 14l3 3-3 3"/></svg>
+          </button>
+          <button class="ctrl" id="btn-prev" title="Previous (p)" aria-label="Previous">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M6 5h2v14H6zM20 5v14L9 12z"/></svg>
+          </button>
+          <button class="ctrl play" id="btn-play" title="Play / pause (space)" aria-label="Play or pause">
+            <svg class="i-play" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M7 4.5v15l13-7.5z"/></svg>
+            <svg class="i-pause" viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M6 4.5h4v15H6zM14 4.5h4v15h-4z"/></svg>
+          </button>
+          <button class="ctrl" id="btn-next" title="Next (n)" aria-label="Next">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M16 5h2v14h-2zM4 5l11 7L4 19z"/></svg>
+          </button>
+          <button class="ctrl" id="btn-stop" title="Stop" aria-label="Stop">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><rect x="6" y="6" width="12" height="12"/></svg>
+          </button>
+          <button class="ctrl mode" id="btn-repeat" title="Repeat (r)" aria-label="Repeat">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2l4 4-4 4M3 11V9a3 3 0 013-3h15M7 22l-4-4 4-4M21 13v2a3 3 0 01-3 3H3"/></svg>
+          </button>
         </div>
-
-        <div class="center-controls">
-          <button class="ctrl-btn mode-btn" id="btn-shuffle" title="Shuffle">⇄</button>
-          <button class="ctrl-btn" id="btn-prev" title="Previous Track">⏮</button>
-          <button class="ctrl-btn play-btn" id="btn-play" title="Play / Pause">▶</button>
-          <button class="ctrl-btn" id="btn-next" title="Next Track">⏭</button>
-          <button class="ctrl-btn" id="btn-stop" title="Stop">⏹</button>
-          <button class="ctrl-btn mode-btn" id="btn-repeat" title="Repeat">↻</button>
+        <div class="scrubber">
+          <span class="time" id="time-current">0:00</span>
+          <div class="progress-track" id="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+          <span class="time r" id="time-duration">0:00</span>
         </div>
+      </div>
 
-        <div class="right-controls">
-          <span id="vol-icon" title="DAC hardware volume (bit-perfect safe)">🔊</span>
-          <input type="range" id="volume-slider" min="0" max="100" value="50">
-          <span id="vol-label" class="time-label">--</span>
+      <div class="tp-right">
+        <div class="tp-rate" id="tp-rate">—</div>
+        <div class="vol">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9z"/><path d="M16.5 8.5a5 5 0 010 7"/></svg>
+          <input type="range" id="volume-slider" min="0" max="100" value="50" aria-label="DAC volume" />
+          <span class="time r" id="vol-label">--</span>
         </div>
       </div>
     </footer>
+
+    <dialog id="shortcuts">
+      <h2>Keyboard shortcuts</h2>
+      <dl>
+        <dt>Space</dt><dd>Play / pause</dd>
+        <dt>← →</dt><dd>Seek 5 s</dd>
+        <dt>↑ ↓</dt><dd>Volume</dd>
+        <dt>n  p</dt><dd>Next / previous</dd>
+        <dt>s  r</dt><dd>Shuffle / repeat</dd>
+        <dt>/</dt><dd>Search library</dd>
+        <dt>1 – 5</dt><dd>Switch view</dd>
+        <dt>?</dt><dd>This list</dd>
+      </dl>
+      <form method="dialog"><button class="btn">Close</button></form>
+    </dialog>
   </body>
 </html>

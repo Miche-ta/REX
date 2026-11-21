@@ -202,8 +202,6 @@ fn play_file_loop(
         .map(|f| f as f64 / sample_rate as f64)
         .unwrap_or(0.0);
 
-    let is_hw = device_id.starts_with("hw:") || device_id.starts_with("plughw:");
-
     // Read metadata tags
     let mut title = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Unknown Title").to_string();
     let mut artist = "Unknown Artist".to_string();
@@ -337,7 +335,7 @@ fn play_file_loop(
     if is_true_bit_perfect {
         log_msg("INFO", format!(">>> ⚡ BIT-PERFECT VERIFIED: Direct HW '{}' @ {} Hz (0 resampling)", resolved_device_id, actual_rate));
     } else {
-        log_msg("WARN", format!(">>> ⚠️ NON-BIT-PERFECT: Active output '{}' running @ {} Hz (Source: {} Hz)", resolved_device_id, actual_rate, sample_rate));
+        log_msg("INFO", format!(">>> 🎛️ IN-ENGINE RESAMPLER: Converting {} Hz -> {} Hz on '{}' (1.0x pitch preserved)", sample_rate, actual_rate, resolved_device_id));
     }
 
     // Update status
@@ -368,12 +366,78 @@ fn play_file_loop(
         Err(_) => return,
     };
 
+    use rubato::{FastFixedIn, PolynomialDegree, Resampler};
+    let mut resampler = if actual_rate != sample_rate {
+        FastFixedIn::<f32>::new(
+            actual_rate as f64 / sample_rate as f64,
+            1.0,
+            PolynomialDegree::Septic,
+            1024,
+            channels as usize,
+        ).ok()
+    } else {
+        None
+    };
+    let mut channel_fifo: Vec<Vec<f32>> = vec![Vec::new(); channels as usize];
+
     let mut current_frame: u64 = 0;
+    let mut sample_buf_f32: Vec<f32> = Vec::new();
     let mut sample_buf_16: Vec<i16> = Vec::new();
     let mut sample_buf_32: Vec<i32> = Vec::new();
 
     let mut reached_eof = false;
     let mut write_failed = false;
+
+    let write_pcm_i32 = |pcm: &PCM, data: &[i32], num_frames: usize| -> Result<(), ()> {
+        if let Ok(io) = pcm.io_i32() {
+            let mut frames_written = 0;
+            let mut retries = 0;
+            while frames_written < num_frames {
+                let offset = frames_written * channels as usize;
+                let slice = &data[offset..];
+                match io.writei(slice) {
+                    Ok(w) => frames_written += w,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        retries += 1;
+                        if retries > 5 || pcm.try_recover(e, true).is_err() {
+                            log_msg("ERROR", format!("ALSA write failed: {msg}"));
+                            return Err(());
+                        }
+                    }
+                }
+            }
+            Ok(())
+        } else {
+            Err(())
+        }
+    };
+
+    let write_pcm_i16 = |pcm: &PCM, data: &[i16], num_frames: usize| -> Result<(), ()> {
+        if let Ok(io) = pcm.io_i16() {
+            let mut frames_written = 0;
+            let mut retries = 0;
+            while frames_written < num_frames {
+                let offset = frames_written * channels as usize;
+                let slice = &data[offset..];
+                match io.writei(slice) {
+                    Ok(w) => frames_written += w,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        retries += 1;
+                        if retries > 5 || pcm.try_recover(e, true).is_err() {
+                            log_msg("ERROR", format!("ALSA write failed: {msg}"));
+                            return Err(());
+                        }
+                    }
+                }
+            }
+            Ok(())
+        } else {
+            Err(())
+        }
+    };
+
     loop {
         // Handle incoming commands
         if let Ok(cmd) = rx.try_recv() {
@@ -428,6 +492,12 @@ fn play_file_loop(
                     let _ = pcm.drop();
                     let _ = pcm.prepare();
                     decoder.reset();
+                    if let Some(ref mut resamp) = resampler {
+                        resamp.reset();
+                        for ch in channel_fifo.iter_mut() {
+                            ch.clear();
+                        }
+                    }
                     if let Ok(mut st) = status.lock() { st.position_seconds = pos; }
                 }
                 EngineCommand::Resume => {}
@@ -453,58 +523,64 @@ fn play_file_loop(
                 let num_samples = audio_buf.samples_interleaved();
                 let num_frames = num_samples / (channels as usize);
 
-                if use_32bit_output {
-                    // Bit-Exact 24-bit / 32-bit streaming directly to DAC
-                    sample_buf_32.resize(num_samples, 0i32);
-                    audio_buf.copy_to_slice_interleaved(&mut sample_buf_32);
+                if let Some(ref mut resamp) = resampler {
+                    // In-Engine Resampling Path (maintains 1.0x speed and original pitch)
+                    sample_buf_f32.resize(num_samples, 0.0f32);
+                    audio_buf.copy_to_slice_interleaved(&mut sample_buf_f32);
+                    let ch_count = channels as usize;
+                    for (i, &s) in sample_buf_f32.iter().enumerate() {
+                        channel_fifo[i % ch_count].push(s);
+                    }
 
-                    if let Ok(io) = pcm.io_i32() {
-                        let mut frames_written = 0;
-                        let mut retries = 0;
-                        while frames_written < num_frames {
-                            let offset = frames_written * channels as usize;
-                            let slice = &sample_buf_32[offset..];
-                            match io.writei(slice) {
-                                Ok(w) => frames_written += w,
-                                Err(e) => {
-                                    // xrun etc.: recover and retry the SAME chunk (no lost samples).
-                                    // Unrecoverable (unplugged / stalled device): stop instead of spinning.
-                                    let msg = e.to_string();
-                                    retries += 1;
-                                    if retries > 5 || pcm.try_recover(e, true).is_err() {
-                                        log_msg("ERROR", format!("ALSA write failed, stopping playback: {msg}"));
-                                        write_failed = true;
-                                        break;
+                    while channel_fifo[0].len() >= resamp.input_frames_next() {
+                        let needed = resamp.input_frames_next();
+                        let in_chunk: Vec<Vec<f32>> = (0..ch_count)
+                            .map(|c| channel_fifo[c].drain(0..needed).collect())
+                            .collect();
+                        if let Ok(out_channels) = resamp.process(&in_chunk, None) {
+                            let out_frames = out_channels[0].len();
+                            if use_32bit_output {
+                                sample_buf_32.clear();
+                                sample_buf_32.reserve(out_frames * ch_count);
+                                for f in 0..out_frames {
+                                    for c in 0..ch_count {
+                                        let s = out_channels[c][f];
+                                        sample_buf_32.push((s * 2147483647.0).clamp(-2147483648.0, 2147483647.0) as i32);
                                     }
+                                }
+                                if write_pcm_i32(&pcm, &sample_buf_32, out_frames).is_err() {
+                                    write_failed = true;
+                                    break;
+                                }
+                            } else {
+                                sample_buf_16.clear();
+                                sample_buf_16.reserve(out_frames * ch_count);
+                                for f in 0..out_frames {
+                                    for c in 0..ch_count {
+                                        let s = out_channels[c][f];
+                                        sample_buf_16.push((s * 32767.0).clamp(-32768.0, 32767.0) as i16);
+                                    }
+                                }
+                                if write_pcm_i16(&pcm, &sample_buf_16, out_frames).is_err() {
+                                    write_failed = true;
+                                    break;
                                 }
                             }
                         }
                     }
                 } else {
-                    // Standard 16-bit integer streaming
-                    sample_buf_16.resize(num_samples, 0i16);
-                    audio_buf.copy_to_slice_interleaved(&mut sample_buf_16);
-
-                    if let Ok(io) = pcm.io_i16() {
-                        let mut frames_written = 0;
-                        let mut retries = 0;
-                        while frames_written < num_frames {
-                            let offset = frames_written * channels as usize;
-                            let slice = &sample_buf_16[offset..];
-                            match io.writei(slice) {
-                                Ok(w) => frames_written += w,
-                                Err(e) => {
-                                    // xrun etc.: recover and retry the SAME chunk (no lost samples).
-                                    // Unrecoverable (unplugged / stalled device): stop instead of spinning.
-                                    let msg = e.to_string();
-                                    retries += 1;
-                                    if retries > 5 || pcm.try_recover(e, true).is_err() {
-                                        log_msg("ERROR", format!("ALSA write failed, stopping playback: {msg}"));
-                                        write_failed = true;
-                                        break;
-                                    }
-                                }
-                            }
+                    // True Bit-Perfect Pass-Through Path (0 alterations, bit-exact)
+                    if use_32bit_output {
+                        sample_buf_32.resize(num_samples, 0i32);
+                        audio_buf.copy_to_slice_interleaved(&mut sample_buf_32);
+                        if write_pcm_i32(&pcm, &sample_buf_32, num_frames).is_err() {
+                            write_failed = true;
+                        }
+                    } else {
+                        sample_buf_16.resize(num_samples, 0i16);
+                        audio_buf.copy_to_slice_interleaved(&mut sample_buf_16);
+                        if write_pcm_i16(&pcm, &sample_buf_16, num_frames).is_err() {
+                            write_failed = true;
                         }
                     }
                 }
@@ -516,7 +592,8 @@ fn play_file_loop(
                 // Report what is actually audible: frames written minus frames still queued in the DAC buffer
                 let queued = pcm.delay().unwrap_or(0).max(0) as u64;
                 if let Ok(mut st) = status.lock() {
-                    st.position_seconds = current_frame.saturating_sub(queued) as f64 / sample_rate as f64;
+                    let queued_src = (queued as f64 * sample_rate as f64 / actual_rate as f64) as u64;
+                    st.position_seconds = current_frame.saturating_sub(queued_src) as f64 / sample_rate as f64;
                 }
             }
             Err(SymphoniaError::DecodeError(_)) => continue,
@@ -524,7 +601,41 @@ fn play_file_loop(
         }
     }
 
-    if reached_eof { let _ = pcm.drain(); } else { let _ = pcm.drop(); }
+    if reached_eof && !write_failed {
+        if let Some(ref mut resamp) = resampler {
+            if !channel_fifo[0].is_empty() {
+                if let Ok(out_channels) = resamp.process_partial(Some(&channel_fifo), None) {
+                    let out_frames = out_channels[0].len();
+                    let ch_count = channels as usize;
+                    if use_32bit_output {
+                        sample_buf_32.clear();
+                        sample_buf_32.reserve(out_frames * ch_count);
+                        for f in 0..out_frames {
+                            for c in 0..ch_count {
+                                let s = out_channels[c][f];
+                                sample_buf_32.push((s * 2147483647.0).clamp(-2147483648.0, 2147483647.0) as i32);
+                            }
+                        }
+                        let _ = write_pcm_i32(&pcm, &sample_buf_32, out_frames);
+                    } else {
+                        sample_buf_16.clear();
+                        sample_buf_16.reserve(out_frames * ch_count);
+                        for f in 0..out_frames {
+                            for c in 0..ch_count {
+                                let s = out_channels[c][f];
+                                sample_buf_16.push((s * 32767.0).clamp(-32768.0, 32767.0) as i16);
+                            }
+                        }
+                        let _ = write_pcm_i16(&pcm, &sample_buf_16, out_frames);
+                    }
+                }
+            }
+        }
+        let _ = pcm.drain();
+    } else {
+        let _ = pcm.drop();
+    }
+
     if let Ok(mut st) = status.lock() {
         st.ended = reached_eof;
         st.is_playing = false;

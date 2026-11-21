@@ -38,7 +38,7 @@ pub fn scan_directory(dir_path: &str) -> Vec<TrackInfo> {
                     dirs_to_visit.push(path);
                 } else if path.is_file() {
                     if let Some(ext) = path.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()) {
-                        if matches!(ext.as_str(), "flac" | "wav" | "ogg" | "mp3") {
+                        if matches!(ext.as_str(), "flac" | "wav" | "ogg" | "mp3" | "m4a" | "aac" | "alac") {
                             if let Some(track) = extract_track_info(&path, &ext) {
                                 tracks.push(track);
                             }

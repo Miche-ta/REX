@@ -10,6 +10,7 @@ pub struct AudioDevice {
     pub name: String,                // Friendly name or card name
     pub description: String,         // ALSA description
     pub is_hardware: bool,           // true if direct hardware (bit-perfect capable)
+    pub is_usb_dac: bool,            // true if external USB DAC with clock switching
     pub min_rate: u32,
     pub max_rate: u32,
     pub supported_rates: Vec<u32>,   // [44100, 48000, 96000, 192000, ...]
@@ -20,7 +21,6 @@ pub struct AudioDevice {
 
 pub fn get_audio_devices() -> Vec<AudioDevice> {
     let mut devices = Vec::new();
-    let audiophile_rates = [44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000];
 
     // 1. Direct Physical Soundcard Enumeration (Direct Hardware / Zero Resampling)
     for card_res in CardIter::new() {
@@ -29,12 +29,15 @@ pub fn get_audio_devices() -> Vec<AudioDevice> {
             let card_name = card.get_name().unwrap_or_else(|_| format!("Card {}", card_idx));
             let card_long = card.get_longname().unwrap_or_default();
 
-            // Ignore HDMI / pure capture cards if possible
-            let is_usb_dac = card_long.to_lowercase().contains("usb") || card_name.to_lowercase().contains("audio");
+            // Detect external USB DAC via kernel stream endpoint or naming
+            let stream_path = format!("/proc/asound/card{}/stream0", card_idx);
+            let has_usb_stream = fs::metadata(&stream_path).is_ok();
+            let is_usb_dac = has_usb_stream
+                || card_long.to_lowercase().contains("usb")
+                || card_name.to_lowercase().contains("usb");
 
             // Read hardware supported rates directly from kernel /proc/asound/cardX/stream0 (for USB DACs)
             let mut hw_rates = Vec::new();
-            let stream_path = format!("/proc/asound/card{}/stream0", card_idx);
             if let Ok(contents) = fs::read_to_string(&stream_path) {
                 for line in contents.lines() {
                     if line.trim().starts_with("Rates:") {
@@ -52,19 +55,37 @@ pub fn get_audio_devices() -> Vec<AudioDevice> {
             hw_rates.sort();
 
             if hw_rates.is_empty() {
-                hw_rates = vec![44100, 48000, 96000, 192000];
+                if is_usb_dac {
+                    hw_rates = vec![44100, 48000, 88200, 96000, 176400, 192000];
+                } else {
+                    // Motherboard analog codecs (e.g. Intel SOF / Realtek) typically clock at 48kHz
+                    hw_rates = vec![48000];
+                }
             }
 
             let min_rate = *hw_rates.first().unwrap_or(&44100);
             let max_rate = *hw_rates.last().unwrap_or(&192000);
 
-            // Add Direct ALSA Hardware (hw:X,0) - Pure Bit-Perfect
+            let (disp_name, disp_desc) = if is_usb_dac {
+                (
+                    format!("⚡ {} (Bit-Perfect USB DAC hw:{},0)", card_name, card_idx),
+                    format!("{} · External USB DAC with native clock switching", card_long),
+                )
+            } else {
+                (
+                    format!("{} (Internal Audio hw:{},0)", card_name, card_idx),
+                    format!("{} · Motherboard audio (fixed 48kHz, in-engine resampled if needed)", card_long),
+                )
+            };
+
+            // Add Direct ALSA Hardware (hw:X,0)
             let hw_id = format!("hw:{},0", card_idx);
             devices.push(AudioDevice {
                 id: hw_id.clone(),
-                name: format!("{} (Direct ALSA hw:{},0)", card_name, card_idx),
-                description: format!("{} · Exclusive Direct Hardware (Zero Resampling)", card_long),
+                name: disp_name,
+                description: disp_desc,
                 is_hardware: true,
+                is_usb_dac,
                 min_rate,
                 max_rate,
                 supported_rates: hw_rates.clone(),
@@ -80,6 +101,7 @@ pub fn get_audio_devices() -> Vec<AudioDevice> {
                 name: format!("{} (ALSA Plug plughw:{},0)", card_name, card_idx),
                 description: format!("{} · Hardware with automatic format negotiation", card_long),
                 is_hardware: true,
+                is_usb_dac,
                 min_rate,
                 max_rate,
                 supported_rates: hw_rates,
@@ -90,12 +112,13 @@ pub fn get_audio_devices() -> Vec<AudioDevice> {
         }
     }
 
-    // 2. Add System Default / PipeWire (with dynamic sample-rate switching support)
+    // 2. Add System Default / PipeWire (shared audio, auto-rate negotiation)
     devices.push(AudioDevice {
         id: "default".into(),
-        name: "PipeWire Media Server (Dynamic Rate Enabled)".into(),
-        description: "Shared audio with dynamic sample-rate clock switching".into(),
+        name: "System Default (PipeWire / Shared Audio)".into(),
+        description: "Shared desktop audio server (auto-rate negotiation & system mixing)".into(),
         is_hardware: false,
+        is_usb_dac: false,
         min_rate: 44100,
         max_rate: 192000,
         supported_rates: vec![44100, 48000, 96000, 192000],
@@ -118,6 +141,7 @@ pub fn get_audio_devices() -> Vec<AudioDevice> {
                         name: format!("ALSA Front: {}", name),
                         description: desc,
                         is_hardware: true,
+                        is_usb_dac: false,
                         min_rate: 44100,
                         max_rate: 192000,
                         supported_rates: vec![44100, 48000, 96000, 192000],

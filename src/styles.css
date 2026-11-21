@@ -154,6 +154,7 @@ kbd { font: 11px var(--mono); color: var(--text-faint); }
 }
 .mark { width: 8px; height: 8px; background: var(--text-faint); flex: none; }
 .mark.ok { background: var(--accent); }
+.mark.info { background: #569cd6; }
 .mark.warn { background: var(--warn); }
 
 .track-title { font-size: 30px; line-height: 1.15; font-weight: 600; letter-spacing: -0.015em; overflow-wrap: anywhere; }

@@ -57,6 +57,8 @@ async function loadAudioDevices() {
     if (!deviceChosen) {
       const saved = store.get("device", "");
       const pick = devices.find((d) => d.id === saved)
+        || devices.find((d) => d.is_usb_dac && !isMic(d))
+        || devices.find((d) => d.id === "default")
         || devices.find((d) => d.is_hardware && !isMic(d))
         || devices.find((d) => !isMic(d))
         || devices[0];
@@ -64,7 +66,7 @@ async function loadAudioDevices() {
       deviceChosen = true;
     }
 
-    sel.innerHTML = devices.map((d) => `<option value="${esc(d.id)}">${esc(d.name)}${d.is_hardware ? " (direct)" : ""}</option>`).join("");
+    sel.innerHTML = devices.map((d) => `<option value="${esc(d.id)}">${esc(d.name)}</option>`).join("");
     sel.value = currentDeviceId;
 
     list.innerHTML = devices.map((d) => {
@@ -391,8 +393,11 @@ function initArtToggle() {
 // =====================================================================
 // Playback
 // =====================================================================
+let isStartingTrack = false;
 async function playTrackByIndex(idx) {
   if (idx < 0 || idx >= currentTrackList.length) return;
+  if (isStartingTrack && currentTrackIndex === idx) return;
+  isStartingTrack = true;
   currentTrackIndex = idx;
   if (orderFor !== currentTrackList || !order.length) buildOrder(idx);
   const track = currentTrackList[idx];
@@ -408,6 +413,8 @@ async function playTrackByIndex(idx) {
     updatePlayPauseButton();
   } catch (err) {
     console.error("Playback error:", err);
+  } finally {
+    setTimeout(() => { isStartingTrack = false; }, 300);
   }
 }
 
@@ -545,8 +552,13 @@ function showStatus(s) {
     $("volume-slider").disabled ? "system" : "DAC hardware",
   ]);
   $("tp-rate").textContent = `${k(hz)} kHz · ${fmt}`;
-  $("signal-dot").className = `mark ${s.is_bit_perfect ? "ok" : "warn"}`;
-  $("signal-hud-text").textContent = s.is_bit_perfect ? "Bit-perfect · direct hardware" : `Not bit-perfect · ${s.active_device_id}`;
+  const resampled = s.sample_rate !== hz;
+  $("signal-dot").className = `mark ${s.is_bit_perfect ? "ok" : resampled ? "info" : "warn"}`;
+  $("signal-hud-text").textContent = s.is_bit_perfect
+    ? "Bit-perfect · direct hardware"
+    : resampled
+      ? `In-engine resampled · ${k(s.sample_rate)} → ${k(hz)} kHz`
+      : `Shared device · ${s.active_device_id}`;
 }
 
 // =====================================================================

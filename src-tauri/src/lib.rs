@@ -1,6 +1,12 @@
 mod audio_engine;
 mod audio_probe;
+mod diagnostics;
 mod library;
+mod lyrics_online;
+mod pcm_format;
+mod pipeline;
+mod reserve;
+mod settings;
 mod mpris;
 pub mod logger;
 
@@ -144,6 +150,21 @@ fn load_playlist(name: String) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// Lyrics fetched online earlier, from the local cache only: never touches the network.
+#[tauri::command(async)]
+fn get_online_lyrics_cached(title: String, artist: String, album: String, duration_secs: u32) -> Option<String> {
+    match lyrics_online::cached(&lyrics_online::cache_key(&title, &artist, &album, duration_secs)) {
+        lyrics_online::Cached::Hit(t) => Some(t),
+        _ => None,
+    }
+}
+
+/// Ask lrclib.net for lyrics. Only called when the user pressed the button or enabled auto-fetch.
+#[tauri::command(async)]
+fn fetch_online_lyrics(title: String, artist: String, album: String, duration_secs: u32, force: bool) -> Result<Option<String>, String> {
+    lyrics_online::fetch(&title, &artist, &album, duration_secs, force)
+}
+
 #[tauri::command(async)]
 fn get_lyrics(file_path: String) -> Option<String> {
     library::get_lyrics(&file_path)
@@ -209,19 +230,84 @@ fn clear_engine_logs() {
 #[tauri::command(async)]
 fn get_kernel_hw_params() -> String {
     let mut out = String::new();
-    for i in 0..5 {
-        let pcm_path = format!("/proc/asound/card{}/pcm0p/sub0/hw_params", i);
-        if let Ok(c) = std::fs::read_to_string(&pcm_path) {
-            let card_name_path = format!("/proc/asound/card{}/id", i);
-            let name = std::fs::read_to_string(&card_name_path).unwrap_or_else(|_| format!("Card {}", i));
-            out.push_str(&format!("=== Card {} [{}]: /proc/asound/card{}/pcm0p/sub0/hw_params ===\n{}\n\n", i, name.trim(), i, c.trim()));
+    for i in 0..8 {
+        let dir = format!("/proc/asound/card{i}");
+        let Ok(id) = std::fs::read_to_string(format!("{dir}/id")) else { continue };
+        out.push_str(&format!("=== card{i} [{}] ===\n", id.trim()));
+        if let Ok(c) = std::fs::read_to_string(format!("{dir}/pcm0p/sub0/hw_params")) {
+            out.push_str(&format!("-- pcm0p/sub0/hw_params --\n{}\n", c.trim()));
         }
+        // USB cards: the descriptor view (altsets, endpoints, clock source) of what the DAC advertises
+        if let Ok(c) = std::fs::read_to_string(format!("{dir}/stream0")) {
+            out.push_str(&format!("-- stream0 --\n{}\n", c.trim()));
+        }
+        out.push('\n');
     }
-    if out.is_empty() {
-        "No active ALSA playback streams found in /proc/asound/ (devices are closed or suspended)".into()
-    } else {
-        out
-    }
+    if out.is_empty() { "No ALSA cards found in /proc/asound".into() } else { out }
+}
+
+/// Tracks from the last scan of this folder, read from the on-disk cache (no music files touched).
+#[tauri::command(async)]
+fn get_cached_library(dir_path: String) -> Vec<TrackInfo> {
+    library::cached_tracks(&dir_path)
+}
+
+#[tauri::command(async)]
+fn get_settings() -> settings::Settings {
+    settings::get()
+}
+
+/// Store (or with None, remove) one small UI setting.
+#[tauri::command(async)]
+fn set_ui_value(key: String, value: Option<String>) {
+    settings::update(|s| match value {
+        Some(v) => { s.ui.insert(key, v); }
+        None => { s.ui.remove(&key); }
+    });
+}
+
+/// How the engine frees the sound card from PipeWire: false = pactl (default), true = ReserveDevice1 over D-Bus.
+#[tauri::command(async)]
+fn set_reserve_dbus(enabled: bool) {
+    settings::update(|s| s.reserve_dbus = enabled);
+}
+
+/// Output buffer and period in milliseconds; used the next time the sound card is opened.
+#[tauri::command(async)]
+fn set_audio_buffer(buffer_ms: u32, period_ms: u32) -> settings::Settings {
+    settings::update(|s| { s.buffer_ms = buffer_ms; s.period_ms = period_ms; })
+}
+
+/// One text block for bug reports: versions, settings, health counters, device state, recent log and kernel lines.
+#[tauri::command(async)]
+fn get_diagnostics() -> String {
+    let cfg = settings::get();
+    let kernel = std::fs::read_to_string("/proc/version").unwrap_or_default();
+    let logs: Vec<String> = logger::get_logs().iter().rev().take(60).rev()
+        .map(|e| format!("{} [{}] {}", e.timestamp, e.level, e.message)).collect();
+    // best effort: USB/audio lines from the kernel log, where controller errors show up
+    let klog = std::process::Command::new("journalctl").args(["-k", "-n", "300", "--no-pager"]).output().ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines()
+            .filter(|l| { let l = l.to_lowercase(); l.contains("xhci") || l.contains("snd-usb") || l.contains("snd_usb") || l.contains("usb 1-") })
+            .rev().take(40).collect::<Vec<_>>().into_iter().rev().map(str::to_string).collect::<Vec<_>>().join("\n"))
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "(none found, or journalctl is not available)".into());
+    format!(
+        "rex-music {}\n{}\nbuffer {} ms / period {} ms\n\n== health counters ==\n{}\n== alsa ==\n{}\n== recent log ==\n{}\n\n== kernel (usb/audio) ==\n{}\n",
+        env!("CARGO_PKG_VERSION"), kernel.trim(), cfg.buffer_ms, cfg.period_ms,
+        diagnostics::counters_text(), get_kernel_hw_params(), logs.join("\n"), klog
+    )
+}
+
+#[tauri::command(async)]
+fn list_volume_controls(device_id: String) -> Vec<String> {
+    audio_engine::list_volume_controls(&device_id)
+}
+
+/// Which mixer control the volume slider drives (None = automatic).
+#[tauri::command(async)]
+fn set_volume_control(name: Option<String>) {
+    audio_engine::set_mixer_pick(name);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -234,6 +320,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .setup(|app| {
+            let _ = audio_engine::APP.set(app.handle().clone());
             mpris::start_mpris_server(app.handle().clone());
             Ok(())
         })
@@ -244,6 +331,8 @@ pub fn run() {
             play_track,
             get_cover,
             get_lyrics,
+            get_online_lyrics_cached,
+            fetch_online_lyrics,
             mpris_update,
             queue_next,
             list_playlists,
@@ -264,6 +353,14 @@ pub fn run() {
             get_engine_logs,
             clear_engine_logs,
             get_kernel_hw_params,
+            get_diagnostics,
+            get_cached_library,
+            get_settings,
+            set_ui_value,
+            set_audio_buffer,
+            set_reserve_dbus,
+            list_volume_controls,
+            set_volume_control,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

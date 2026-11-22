@@ -1,20 +1,9 @@
-use std::fs::File;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
 
-use alsa::pcm::{Access, Format, HwParams, PCM};
-use alsa::{Direction, ValueOr};
+use alsa::pcm::{IO, PCM};
 use serde::{Deserialize, Serialize};
-
-use symphonia::core::codecs::audio::AudioDecoderOptions;
-use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::{FormatOptions, SeekMode, SeekTo, TrackType};
-use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::{MetadataOptions, StandardTag};
-use symphonia::core::units::Time;
+use tauri::Emitter;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaybackStatus {
@@ -37,6 +26,8 @@ pub struct PlaybackStatus {
     pub is_bit_perfect: bool,
     pub ended: bool, // true only when the track played to its natural end
     pub replay_gain_db: f32, // track ReplayGain tag in dB, 0 when absent
+    pub decoder_serial: u64, // bumps each time the decoder starts a track (it can be ahead of what is audible)
+    pub decoding_path: Option<String>, // the file the decoder is on (can be a track ahead of what is audible)
     pub track_serial: u64, // bumps every time a track starts (also when the engine advances by itself)
     pub vu_left: f32,
     pub vu_right: f32,
@@ -64,6 +55,8 @@ impl Default for PlaybackStatus {
             is_bit_perfect: false,
             ended: false,
             replay_gain_db: 0.0,
+            decoder_serial: 0,
+            decoding_path: None,
             track_serial: 0,
             vu_left: 0.0,
             vu_right: 0.0,
@@ -71,23 +64,17 @@ impl Default for PlaybackStatus {
     }
 }
 
-/// An open, configured PCM carried from one track to the next, so the device is never closed
-/// between tracks (no gap, no EBUSY race with PipeWire).
-struct Kept {
-    pcm: PCM,
-    device_id: String,
-    rate: u32,
-    channels: u32,
-    wide: bool, // source is 24-bit or more
-    use_32bit: bool,
-    fmt: String,
-    buffer: u64,
-    period: u64,
-    drain_first: bool, // stream is still running with the previous track's tail in it
+/// Set once at startup so the engine thread can tell the UI that something changed.
+pub static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+pub(crate) fn announce() {
+    if let Some(app) = APP.get() {
+        let _ = app.emit("player-event", ());
+    }
 }
 
 /// Path of the track that should follow the current one (set by the UI).
-type NextHint = Arc<Mutex<Option<String>>>;
+pub(crate) type NextHint = Arc<Mutex<Option<String>>>;
 
 pub enum EngineCommand {
     Play {
@@ -173,638 +160,69 @@ fn run_audio_worker(
     status: Arc<Mutex<PlaybackStatus>>,
     next_hint_w: NextHint,
 ) {
-    while let Ok(cmd) = rx.recv() {
-        match cmd {
-            EngineCommand::Play { file_path, device_id } => {
-                // play_file_loop returns (and drops its PCM) before the next track opens
-                let mut next = Some((file_path, device_id));
-                let mut kept: Option<Kept> = None;
-                while let Some((f, d)) = next.take() {
-                    play_file_loop(&rx, &status, &next_hint_w, &f, &d, &mut next, &mut kept);
-                }
-                drop(kept);
-                release_device_to_pipewire();
-                // a hand-off to a file that would not open must not leave the UI "playing"
-                if let Ok(mut st) = status.lock() {
-                    st.is_playing = false;
-                    st.is_paused = false;
-                    st.vu_left = 0.0;
-                    st.vu_right = 0.0;
-                }
-            }
-            EngineCommand::Stop => {
-                let mut st = status.lock().unwrap_or_else(|e| e.into_inner());
-                st.is_playing = false;
-                st.is_paused = false;
-                st.position_seconds = 0.0;
-                st.vu_left = 0.0;
-                st.vu_right = 0.0;
-            }
-            _ => {}
-        }
-    }
+    crate::pipeline::run(rx, status, next_hint_w);
 }
 
-fn play_file_loop(
-    rx: &std::sync::mpsc::Receiver<EngineCommand>,
-    status: &Arc<Mutex<PlaybackStatus>>,
-    next_hint: &NextHint,
-    file_path: &str,
-    device_id: &str,
-    next: &mut Option<(String, String)>,
-    kept: &mut Option<Kept>,
-) {
-    let path = Path::new(file_path);
-    let src = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return,
-    };
-
-    let mss = MediaSourceStream::new(Box::new(src), Default::default());
-    let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-        hint.with_extension(ext);
-    }
-
-    let fmt_opts = FormatOptions::default();
-    let meta_opts = MetadataOptions::default();
-    let dec_opts = AudioDecoderOptions::default();
-
-    let mut format_reader = match symphonia::default::get_probe().probe(&hint, mss, fmt_opts, meta_opts) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-
-    let track = match format_reader.default_track(TrackType::Audio) {
-        Some(t) => t.clone(),
-        None => return,
-    };
-
-    let track_id = track.id;
-    let codec_params = match track.codec_params.as_ref() {
-        Some(cp) => cp,
-        None => return,
-    };
-
-    let audio_params = match codec_params.audio() {
-        Some(ap) => ap,
-        None => return,
-    };
-
-    let sample_rate = audio_params.sample_rate.unwrap_or(44100);
-    let channels = audio_params.channels.as_ref().map(|c| c.count() as u32).unwrap_or(2);
-    let bits_per_sample = audio_params.bits_per_sample.unwrap_or(16);
-
-    let duration_seconds = track
-        .num_frames
-        .map(|f| f as f64 / sample_rate as f64)
-        .unwrap_or(0.0);
-
-    // Read metadata tags
-    let mut title = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Unknown Title").to_string();
-    let mut artist = "Unknown Artist".to_string();
-    let mut album = "Local Audio".to_string();
-    let mut replay_gain: f32 = 0.0;
-
-    if let Some(meta) = format_reader.metadata().current() {
-        for tag in &meta.media.tags {
-            if let Some(ref std_tag) = tag.std {
-                match std_tag {
-                    StandardTag::TrackTitle(t) => title = t.to_string(),
-                    StandardTag::Artist(a) => artist = a.to_string(),
-                    StandardTag::Album(al) => album = al.to_string(),
-                    StandardTag::ReplayGainTrackGain(g) => {
-                        // e.g. "-6.50 dB"
-                        replay_gain = g.trim().trim_end_matches("dB").trim().parse().unwrap_or(0.0);
-                    }
-                    _ => {}
+/// Write `num_frames` frames, retrying after recoverable errors (xrun) with the same data.
+/// `items_per_frame` is how many items of `data` make up one frame (channels, or 3 x channels for packed bytes).
+pub(crate) fn write_all<S: Copy>(pcm: &PCM, io: &IO<'_, S>, data: &[S], num_frames: usize, items_per_frame: usize) -> Result<(), ()> {
+    let mut written = 0;
+    let mut retries = 0;
+    while written < num_frames {
+        match io.writei(&data[written * items_per_frame..]) {
+            Ok(w) => written += w,
+            Err(e) => {
+                use std::sync::atomic::Ordering::Relaxed;
+                let msg = e.to_string();
+                if e.errno() == 32 { crate::diagnostics::XRUNS.fetch_add(1, Relaxed); } // EPIPE
+                retries += 1;
+                if retries > 5 || pcm.try_recover(e, true).is_err() {
+                    crate::diagnostics::WRITE_FAILS.fetch_add(1, Relaxed);
+                    crate::logger::log_msg("ERROR", format!("ALSA write failed: {msg}"));
+                    return Err(());
                 }
+                crate::diagnostics::RECOVERED.fetch_add(1, Relaxed);
             }
         }
     }
-
-    use crate::logger::log_msg;
-
-    log_msg("INFO", format!("Playing: {} ({})", title, path.display()));
-    log_msg("INFO", format!("Track Format: {} Hz · {}-bit · {} channels · Duration: {:.2}s", sample_rate, bits_per_sample, channels, duration_seconds));
-    log_msg("ALSA", format!("Requesting audio output endpoint: '{}'", device_id));
-
-    let wide = bits_per_sample >= 24;
-    let resolved_device_id = device_id.to_string();
-    let mut actual_rate = sample_rate;
-    let mut actual_buffer: u64 = 0;
-    let mut actual_period: u64 = 0;
-    let mut actual_format_str = "S16_LE".to_string();
-    let mut use_32bit_output = false;
-
-    // Same device, rate, channels and sample width as the open PCM: keep it (gapless, no EBUSY).
-    let reuse = match kept.take() {
-        Some(k) if k.device_id == device_id && k.rate == sample_rate && k.channels == channels && k.wide == wide => Some(k),
-        Some(k) => {
-            if k.drain_first { let _ = k.pcm.drain(); } // let the previous track's tail finish
-            None
-        }
-        None => None,
-    };
-
-    let pcm = if let Some(k) = reuse {
-        log_msg("ALSA", format!("Gapless: reusing open PCM '{}' @ {} Hz", device_id, k.rate));
-        actual_rate = k.rate;
-        actual_buffer = k.buffer;
-        actual_period = k.period;
-        actual_format_str = k.fmt;
-        use_32bit_output = k.use_32bit;
-        k.pcm
-    } else {
-        claim_device_from_pipewire(device_id);
-
-        // Open target PCM. EBUSY can linger briefly after the previous stream closes, so retry.
-        // Never fall back to another device: "default" may be a mic or the resampling mixer.
-        let mut opened = None;
-        for attempt in 0..10 {
-            match PCM::new(device_id, Direction::Playback, false) {
-                Ok(p) => { opened = Some(p); break; }
-                Err(err) if err.errno() == 16 && attempt < 9 => {
-                    thread::sleep(Duration::from_millis(100));
-                }
-                Err(err) => {
-                    log_msg("ERROR", format!("Failed to open '{}': {:?}. (EBUSY = another process, e.g. WirePlumber/PipeWire, holds the card)", device_id, err));
-                    break;
-                }
-            }
-        }
-        let Some(pcm) = opened else {
-            log_msg("ERROR", "Playback aborted: no fallback device used.");
-            if let Ok(mut st) = status.lock() { st.is_playing = false; }
-            return;
-        };
-        log_msg("ALSA", format!("✓ Successfully claimed PCM: '{}'", device_id));
-
-
-        if let Ok(hwp) = HwParams::any(&pcm) {
-            // 1. MUST set access method first
-            let _ = hwp.set_access(Access::RWInterleaved);
-
-            // 2. CRITICAL: Disable ALSA rate resampling! Forces bit-perfect matching
-            let _ = hwp.set_rate_resample(false);
-
-            // 3. Set Format: if 24-bit or 32-bit, prefer S32_LE or S24_3LE
-            let chosen_format = if bits_per_sample >= 24 {
-                if hwp.test_format(Format::s32()).is_ok() {
-                    use_32bit_output = true;
-                    actual_format_str = "S32_LE (Bit-Exact 24/32)".to_string();
-                    Format::s32()
-                } else if hwp.test_format(Format::s24_3()).is_ok() {
-                    use_32bit_output = true;
-                    actual_format_str = "S24_3LE (Bit-Exact 24)".to_string();
-                    Format::s24_3()
-                } else {
-                    actual_format_str = "S16_LE (Truncated to 16)".to_string();
-                    Format::s16()
-                }
-            } else {
-                if hwp.test_format(Format::s16()).is_ok() {
-                    actual_format_str = "S16_LE (Bit-Exact 16)".to_string();
-                    Format::s16()
-                } else if hwp.test_format(Format::s32()).is_ok() {
-                    use_32bit_output = true;
-                    actual_format_str = "S32_LE (16-bit Padded to 32)".to_string();
-                    Format::s32()
-                } else {
-                    Format::s16()
-                }
-            };
-
-            let _ = hwp.set_format(chosen_format);
-            let _ = hwp.set_channels(channels);
-
-            // 4. Request the exact sample rate (e.g. 192000, 96000, 44100)
-            let _ = hwp.set_rate_near(sample_rate, ValueOr::Nearest);
-
-            // Bounded buffer: 500ms buffer / 100ms period (MPD-like). The default is the device
-            // maximum (~2s), which is hard on USB audio and makes seeks lag.
-            let _ = hwp.set_buffer_time_near(500_000, ValueOr::Nearest);
-            let _ = hwp.set_period_time_near(100_000, ValueOr::Nearest);
-
-            // Apply hardware params
-            match pcm.hw_params(&hwp) {
-                Ok(_) => {
-                    if let Ok(curr) = pcm.hw_params_current() {
-                        if let Ok(r) = curr.get_rate() {
-                            actual_rate = r;
-                        }
-                        actual_buffer = curr.get_buffer_size().unwrap_or(0).max(0) as u64;
-                        actual_period = curr.get_period_size().unwrap_or(0).max(0) as u64;
-                    }
-                    log_msg("ALSA", format!("HwParams applied: {} Hz · {}", actual_rate, actual_format_str));
-                }
-                Err(e) => {
-                    log_msg("ERROR", format!("Failed to apply HwParams: {:?}", e));
-                }
-            }
-        }
-
-        if let (Ok(swp), Ok(hwp_curr)) = (pcm.sw_params_current(), pcm.hw_params_current()) {
-            if let Ok(buf_size) = hwp_curr.get_buffer_size() {
-                let _ = swp.set_start_threshold(buf_size);
-                let _ = pcm.sw_params(&swp);
-                log_msg("ALSA", format!("SwParams start threshold set to buffer size: {}", buf_size));
-            }
-        }
-
-        pcm
-    };
-
-    let is_really_hw = resolved_device_id.starts_with("hw:") || resolved_device_id.starts_with("plughw:");
-    let is_true_bit_perfect = is_really_hw && actual_rate == sample_rate;
-
-    if is_true_bit_perfect {
-        log_msg("INFO", format!(">>> ⚡ BIT-PERFECT VERIFIED: Direct HW '{}' @ {} Hz (0 resampling)", resolved_device_id, actual_rate));
-    } else {
-        log_msg("INFO", format!(">>> 🎛️ IN-ENGINE RESAMPLER: Converting {} Hz -> {} Hz on '{}' (1.0x pitch preserved)", sample_rate, actual_rate, resolved_device_id));
-    }
-
-    // Update status
-    {
-        let mut st = status.lock().unwrap_or_else(|e| e.into_inner());
-        st.is_playing = true;
-        st.ended = false;
-        st.track_serial += 1;
-        st.replay_gain_db = replay_gain;
-        st.is_paused = false;
-        st.position_seconds = 0.0;
-        st.duration_seconds = duration_seconds;
-        st.file_path = Some(file_path.to_string());
-        st.title = title;
-        st.artist = artist;
-        st.album = album;
-        st.sample_rate = sample_rate;
-        st.bit_depth = bits_per_sample;
-        st.channels = channels;
-        st.active_device_id = resolved_device_id;
-        st.active_hardware_rate = actual_rate;
-        st.active_hardware_format = actual_format_str.clone();
-        st.active_buffer_frames = actual_buffer;
-        st.active_period_frames = actual_period;
-        st.is_bit_perfect = is_true_bit_perfect;
-    }
-
-    let mut decoder = match symphonia::default::get_codecs().make_audio_decoder(audio_params, &dec_opts) {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-
-    use rubato::{FastFixedIn, PolynomialDegree, Resampler};
-    let mut resampler = if actual_rate != sample_rate {
-        FastFixedIn::<f32>::new(
-            actual_rate as f64 / sample_rate as f64,
-            1.0,
-            PolynomialDegree::Septic,
-            1024,
-            channels as usize,
-        ).ok()
-    } else {
-        None
-    };
-    let mut channel_fifo: Vec<Vec<f32>> = vec![Vec::new(); channels as usize];
-
-    let mut current_frame: u64 = 0;
-    let mut sample_buf_f32: Vec<f32> = Vec::new();
-    let mut sample_buf_16: Vec<i16> = Vec::new();
-    let mut sample_buf_32: Vec<i32> = Vec::new();
-
-    let mut reached_eof = false;
-    let mut write_failed = false;
-
-    let write_pcm_i32 = |pcm: &PCM, data: &[i32], num_frames: usize| -> Result<(), ()> {
-        if let Ok(io) = pcm.io_i32() {
-            let mut frames_written = 0;
-            let mut retries = 0;
-            while frames_written < num_frames {
-                let offset = frames_written * channels as usize;
-                let slice = &data[offset..];
-                match io.writei(slice) {
-                    Ok(w) => frames_written += w,
-                    Err(e) => {
-                        let msg = e.to_string();
-                        retries += 1;
-                        if retries > 5 || pcm.try_recover(e, true).is_err() {
-                            log_msg("ERROR", format!("ALSA write failed: {msg}"));
-                            return Err(());
-                        }
-                    }
-                }
-            }
-            Ok(())
-        } else {
-            Err(())
-        }
-    };
-
-    let write_pcm_i16 = |pcm: &PCM, data: &[i16], num_frames: usize| -> Result<(), ()> {
-        if let Ok(io) = pcm.io_i16() {
-            let mut frames_written = 0;
-            let mut retries = 0;
-            while frames_written < num_frames {
-                let offset = frames_written * channels as usize;
-                let slice = &data[offset..];
-                match io.writei(slice) {
-                    Ok(w) => frames_written += w,
-                    Err(e) => {
-                        let msg = e.to_string();
-                        retries += 1;
-                        if retries > 5 || pcm.try_recover(e, true).is_err() {
-                            log_msg("ERROR", format!("ALSA write failed: {msg}"));
-                            return Err(());
-                        }
-                    }
-                }
-            }
-            Ok(())
-        } else {
-            Err(())
-        }
-    };
-
-    loop {
-        // Handle incoming commands
-        if let Ok(cmd) = rx.try_recv() {
-            match cmd {
-                EngineCommand::Stop => {
-                    let _ = pcm.drop();
-                    break;
-                }
-                EngineCommand::Play { file_path: new_file, device_id: new_dev } => {
-                    *next = Some((new_file, new_dev));
-                    let _ = pcm.drop(); // discard queued audio, but keep the device open for the next track
-                    let _ = pcm.prepare();
-                    *kept = Some(Kept { pcm, device_id: device_id.to_string(), rate: actual_rate, channels, wide,
-                        use_32bit: use_32bit_output, fmt: actual_format_str.clone(), buffer: actual_buffer,
-                        period: actual_period, drain_first: false });
-                    return;
-                }
-                EngineCommand::Pause => {
-                    if let Ok(mut st) = status.lock() {
-                        st.is_paused = true;
-                        st.vu_left = 0.0;
-                        st.vu_right = 0.0;
-                    }
-                    let _ = pcm.pause(true);
-                    loop {
-                        thread::sleep(Duration::from_millis(50));
-                        if let Ok(resume_cmd) = rx.recv() {
-                            match resume_cmd {
-                                EngineCommand::Resume => {
-                                    if let Ok(mut st) = status.lock() {
-                                        st.is_paused = false;
-                                    }
-                                    let _ = pcm.pause(false);
-                                    break;
-                                }
-                                EngineCommand::Stop => return,
-                                EngineCommand::Play { file_path: f, device_id: d } => {
-                                    *next = Some((f, d));
-                                    let _ = pcm.drop(); // discard queued audio, but keep the device open for the next track
-                                    let _ = pcm.prepare();
-                                    *kept = Some(Kept { pcm, device_id: device_id.to_string(), rate: actual_rate, channels, wide,
-                                        use_32bit: use_32bit_output, fmt: actual_format_str.clone(), buffer: actual_buffer,
-                                        period: actual_period, drain_first: false });
-                                    return;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                EngineCommand::Seek(pos) => {
-                    let time = Time::try_from_secs_f64(pos).unwrap_or(Time::ZERO);
-                    let _ = format_reader.seek(
-                        SeekMode::Accurate,
-                        SeekTo::Time {
-                            time,
-                            track_id: Some(track_id),
-                        },
-                    );
-                    current_frame = (pos * sample_rate as f64) as u64;
-                    // flush audio already queued in the DAC buffer so the jump is immediate
-                    let _ = pcm.drop();
-                    let _ = pcm.prepare();
-                    decoder.reset();
-                    if let Some(ref mut resamp) = resampler {
-                        resamp.reset();
-                        for ch in channel_fifo.iter_mut() {
-                            ch.clear();
-                        }
-                    }
-                    if let Ok(mut st) = status.lock() { st.position_seconds = pos; }
-                }
-                EngineCommand::Resume => {}
-            }
-        }
-
-        // Fetch packet from audio stream
-        let packet = match format_reader.next_packet() {
-            Ok(Some(pkt)) => pkt,
-            Ok(None) => { reached_eof = true; break; } // Reached EOF
-            Err(SymphoniaError::ResetRequired) => break,
-            // some demuxers report end of stream as an I/O error: still a natural end
-            Err(SymphoniaError::IoError(_)) => { reached_eof = true; break; }
-            Err(_) => break,
-        };
-
-        if packet.track_id != track_id {
-            continue;
-        }
-
-        match decoder.decode(&packet) {
-            Ok(audio_buf) => {
-                let num_samples = audio_buf.samples_interleaved();
-                let num_frames = num_samples / (channels as usize);
-
-                if let Some(ref mut resamp) = resampler {
-                    // In-Engine Resampling Path (maintains 1.0x speed and original pitch)
-                    sample_buf_f32.resize(num_samples, 0.0f32);
-                    audio_buf.copy_to_slice_interleaved(&mut sample_buf_f32);
-                    let ch_count = channels as usize;
-                    for (i, &s) in sample_buf_f32.iter().enumerate() {
-                        channel_fifo[i % ch_count].push(s);
-                    }
-
-                    while channel_fifo[0].len() >= resamp.input_frames_next() {
-                        let needed = resamp.input_frames_next();
-                        let in_chunk: Vec<Vec<f32>> = (0..ch_count)
-                            .map(|c| channel_fifo[c].drain(0..needed).collect())
-                            .collect();
-                        if let Ok(out_channels) = resamp.process(&in_chunk, None) {
-                            let out_frames = out_channels[0].len();
-                            if use_32bit_output {
-                                sample_buf_32.clear();
-                                sample_buf_32.reserve(out_frames * ch_count);
-                                for f in 0..out_frames {
-                                    for c in 0..ch_count {
-                                        let s = out_channels[c][f];
-                                        sample_buf_32.push((s * 2147483647.0).clamp(-2147483648.0, 2147483647.0) as i32);
-                                    }
-                                }
-                                if write_pcm_i32(&pcm, &sample_buf_32, out_frames).is_err() {
-                                    write_failed = true;
-                                    break;
-                                }
-                            } else {
-                                sample_buf_16.clear();
-                                sample_buf_16.reserve(out_frames * ch_count);
-                                for f in 0..out_frames {
-                                    for c in 0..ch_count {
-                                        let s = out_channels[c][f];
-                                        sample_buf_16.push((s * 32767.0).clamp(-32768.0, 32767.0) as i16);
-                                    }
-                                }
-                                if write_pcm_i16(&pcm, &sample_buf_16, out_frames).is_err() {
-                                    write_failed = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // True Bit-Perfect Pass-Through Path (0 alterations, bit-exact)
-                    if use_32bit_output {
-                        sample_buf_32.resize(num_samples, 0i32);
-                        audio_buf.copy_to_slice_interleaved(&mut sample_buf_32);
-                        if write_pcm_i32(&pcm, &sample_buf_32, num_frames).is_err() {
-                            write_failed = true;
-                        }
-                    } else {
-                        sample_buf_16.resize(num_samples, 0i16);
-                        audio_buf.copy_to_slice_interleaved(&mut sample_buf_16);
-                        if write_pcm_i16(&pcm, &sample_buf_16, num_frames).is_err() {
-                            write_failed = true;
-                        }
-                    }
-                }
-
-                if write_failed { break; }
-
-                current_frame += num_frames as u64;
-
-                let (vu_l, vu_r) = if use_32bit_output {
-                    let mut max_l: u32 = 0;
-                    let mut max_r: u32 = 0;
-                    for chunk in sample_buf_32.chunks_exact(channels as usize) {
-                        let l = chunk[0].unsigned_abs();
-                        if l > max_l { max_l = l; }
-                        if channels > 1 {
-                            let r = chunk[1].unsigned_abs();
-                            if r > max_r { max_r = r; }
-                        } else {
-                            max_r = max_l;
-                        }
-                    }
-                    (
-                        (max_l as f32 / 2147483648.0).clamp(0.0, 1.0),
-                        (max_r as f32 / 2147483648.0).clamp(0.0, 1.0),
-                    )
-                } else {
-                    let mut max_l: u16 = 0;
-                    let mut max_r: u16 = 0;
-                    for chunk in sample_buf_16.chunks_exact(channels as usize) {
-                        let l = chunk[0].unsigned_abs();
-                        if l > max_l { max_l = l; }
-                        if channels > 1 {
-                            let r = chunk[1].unsigned_abs();
-                            if r > max_r { max_r = r; }
-                        } else {
-                            max_r = max_l;
-                        }
-                    }
-                    (
-                        (max_l as f32 / 32768.0).clamp(0.0, 1.0),
-                        (max_r as f32 / 32768.0).clamp(0.0, 1.0),
-                    )
-                };
-
-                // Report what is actually audible: frames written minus frames still queued in the DAC buffer
-                let queued = pcm.delay().unwrap_or(0).max(0) as u64;
-                if let Ok(mut st) = status.lock() {
-                    let queued_src = (queued as f64 * sample_rate as f64 / actual_rate as f64) as u64;
-                    st.position_seconds = current_frame.saturating_sub(queued_src) as f64 / sample_rate as f64;
-                    // peak since the UI last looked, so short transients are not missed between polls
-                    st.vu_left = st.vu_left.max(vu_l);
-                    st.vu_right = st.vu_right.max(vu_r);
-                }
-            }
-            Err(SymphoniaError::DecodeError(_)) => continue,
-            Err(_) => break,
-        }
-    }
-
-    if reached_eof && !write_failed {
-        if let Some(ref mut resamp) = resampler {
-            if !channel_fifo[0].is_empty() {
-                if let Ok(out_channels) = resamp.process_partial(Some(&channel_fifo), None) {
-                    let out_frames = out_channels[0].len();
-                    let ch_count = channels as usize;
-                    if use_32bit_output {
-                        sample_buf_32.clear();
-                        sample_buf_32.reserve(out_frames * ch_count);
-                        for f in 0..out_frames {
-                            for c in 0..ch_count {
-                                let s = out_channels[c][f];
-                                sample_buf_32.push((s * 2147483647.0).clamp(-2147483648.0, 2147483647.0) as i32);
-                            }
-                        }
-                        let _ = write_pcm_i32(&pcm, &sample_buf_32, out_frames);
-                    } else {
-                        sample_buf_16.clear();
-                        sample_buf_16.reserve(out_frames * ch_count);
-                        for f in 0..out_frames {
-                            for c in 0..ch_count {
-                                let s = out_channels[c][f];
-                                sample_buf_16.push((s * 32767.0).clamp(-32768.0, 32767.0) as i16);
-                            }
-                        }
-                        let _ = write_pcm_i16(&pcm, &sample_buf_16, out_frames);
-                    }
-                }
-            }
-        }
-        // Gapless: if the UI named a next track, leave the stream running and hand the open PCM over.
-        // ponytail: the title flips up to one buffer (500 ms) before the last notes are audible.
-        let next_path = next_hint.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(np) = next_path {
-            *next = Some((np, device_id.to_string()));
-            *kept = Some(Kept { pcm, device_id: device_id.to_string(), rate: actual_rate, channels, wide,
-                use_32bit: use_32bit_output, fmt: actual_format_str.clone(), buffer: actual_buffer,
-                period: actual_period, drain_first: true });
-            return; // still "playing": the next track sets the status
-        }
-        let _ = pcm.drain();
-    } else {
-        let _ = pcm.drop();
-    }
-
-    if let Ok(mut st) = status.lock() {
-        st.ended = reached_eof;
-        st.is_playing = false;
-        st.is_paused = false;
-        st.position_seconds = 0.0;
-        st.vu_left = 0.0;
-        st.vu_right = 0.0;
-    }
+    Ok(())
 }
 
 /// Hardware (DAC) volume via the ALSA mixer: leaves the PCM stream untouched, so bit-perfect stays intact.
 /// `device_id` like "hw:2,0" -> mixer card "hw:2". Returns the control's volume as 0..=100.
-fn with_volume_ctl<T>(device_id: &str, f: impl FnOnce(&alsa::mixer::Selem, i64, i64) -> Option<T>) -> Option<T> {
-    use alsa::mixer::{Mixer, SelemId};
+static MIXER_PICK: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn set_mixer_pick(name: Option<String>) {
+    *MIXER_PICK.lock().unwrap_or_else(|e| e.into_inner()) = name.filter(|n| !n.is_empty());
+}
+
+fn open_mixer(device_id: &str) -> Option<alsa::mixer::Mixer> {
     let card = device_id.split(',').next()?.replace("plughw:", "hw:");
     if !card.starts_with("hw:") { return None; }
-    let mixer = Mixer::new(&card, false).ok()?;
-    // first playback-volume control, preferring the usual names
+    alsa::mixer::Mixer::new(&card, false).ok()
+}
+
+/// Names of the mixer controls on this card that have a playback volume.
+pub fn list_volume_controls(device_id: &str) -> Vec<String> {
+    let Some(mixer) = open_mixer(device_id) else { return vec![] };
+    mixer.iter().filter_map(|e| alsa::mixer::Selem::new(e))
+        .filter(|s| s.has_playback_volume())
+        .filter_map(|s| s.get_id().get_name().ok().map(str::to_string))
+        .collect()
+}
+
+fn with_volume_ctl<T>(device_id: &str, f: impl FnOnce(&alsa::mixer::Selem, i64, i64) -> Option<T>) -> Option<T> {
+    use alsa::mixer::SelemId;
+    let mixer = open_mixer(device_id)?;
     let ids: Vec<SelemId> = mixer.iter().filter_map(|e| alsa::mixer::Selem::new(e)).map(|s| s.get_id()).collect();
-    let pick = ["PCM", "Master", "Headphone", "Speaker"].iter()
-        .find_map(|n| ids.iter().find(|i| i.get_name().ok() == Some(*n)))
-        .or_else(|| ids.iter().find(|i| mixer.find_selem(i).map_or(false, |s| s.has_playback_volume())))?;
+    let has_vol = |i: &SelemId| mixer.find_selem(i).map_or(false, |s| s.has_playback_volume());
+    // the control the user picked, else the usual names, else the first one with a volume
+    let wanted = MIXER_PICK.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let pick = wanted.as_deref()
+        .and_then(|w| ids.iter().find(|i| i.get_name().ok() == Some(w)).filter(|i| has_vol(i)))
+        .or_else(|| ["PCM", "Master", "Headphone", "Speaker"].iter()
+            .find_map(|n| ids.iter().find(|i| i.get_name().ok() == Some(*n))))
+        .or_else(|| ids.iter().find(|i| has_vol(i)))?;
     let sel = mixer.find_selem(pick)?;
     if !sel.has_playback_volume() { return None; }
     let (lo, hi) = sel.get_playback_volume_range();
@@ -847,9 +265,16 @@ fn card_of(device_id: &str) -> Option<String> {
     Some(rest.split(',').next()?.to_string())
 }
 
-fn claim_device_from_pipewire(device_id: &str) {
+pub(crate) fn claim_device_from_pipewire(device_id: &str) {
     use crate::logger::log_msg;
     let Some(card) = card_of(device_id) else { return };
+    if crate::settings::get().reserve_dbus {
+        if crate::reserve::claim(&card) {
+            log_msg("INFO", format!("Reserved card {card} over D-Bus (ReserveDevice1)"));
+            return;
+        }
+        log_msg("WARN", format!("D-Bus reservation of card {card} failed; falling back to pactl"));
+    }
     let Some(listing) = pactl(&["list", "sinks"]) else { return }; // no pactl: nothing to do
     let needle = format!("alsa.card = \"{card}\"");
     let mut name: Option<String> = None;
@@ -870,9 +295,151 @@ fn claim_device_from_pipewire(device_id: &str) {
 
 /// Give suspended sinks back to PipeWire (end of playback, or app exit).
 pub fn release_device_to_pipewire() {
+    crate::reserve::release_all();
     let sinks: Vec<String> = SUSPENDED_SINKS.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
     for n in sinks {
         pactl(&["suspend-sink", &n, "0"]);
         crate::logger::log_msg("INFO", format!("Returned sink to PipeWire: {n}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alsa::Direction;
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::time::Duration;
+
+    /// A short stereo sine as a canonical PCM WAV file (16- or 24-bit).
+    fn wav_bytes(rate: u32, bits: u16, frames: u32) -> Vec<u8> {
+        let ch = 2u16;
+        let bytes = bits / 8;
+        let data_len = frames * ch as u32 * bytes as u32;
+        let mut w = Vec::new();
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + data_len).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        w.extend_from_slice(&ch.to_le_bytes());
+        w.extend_from_slice(&rate.to_le_bytes());
+        w.extend_from_slice(&(rate * ch as u32 * bytes as u32).to_le_bytes());
+        w.extend_from_slice(&(ch * bytes).to_le_bytes());
+        w.extend_from_slice(&bits.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&data_len.to_le_bytes());
+        for n in 0..frames {
+            let v = (n as f64 * 440.0 * std::f64::consts::TAU / rate as f64).sin() * 0.3;
+            for _ in 0..ch {
+                let s = (v * if bits == 16 { 32767.0 } else { 8_388_607.0 }) as i32;
+                w.extend_from_slice(&s.to_le_bytes()[..bytes as usize]);
+            }
+        }
+        w
+    }
+
+    #[test]
+    fn wav_generator_writes_a_consistent_header() {
+        let w = wav_bytes(44100, 24, 100);
+        assert_eq!(&w[0..4], b"RIFF");
+        assert_eq!(w.len(), 44 + 100 * 2 * 3);
+        assert_eq!(u32::from_le_bytes(w[40..44].try_into().unwrap()), 600);
+    }
+
+    fn wait_for(engine: &AudioEngineHandle, secs: u64, mut ok: impl FnMut(&PlaybackStatus) -> bool) -> bool {
+        for _ in 0..secs * 20 {
+            if ok(&engine.peek_status()) { return true; }
+            thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// Plays synthetic files through the real engine on a fake sound card. Not part of the normal run:
+    ///   sudo modprobe snd-dummy && cargo test dummy_card -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs a fake sound card: sudo modprobe snd-dummy"]
+    fn dummy_card_gapless_and_rate_change() {
+        let dev = "hw:Dummy,0";
+        if PCM::new(dev, Direction::Playback, false).is_err() {
+            eprintln!("skipped: no {dev} (run: sudo modprobe snd-dummy)");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("rex-dummy-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |name: &str, rate, bits| {
+            let p = dir.join(name);
+            std::fs::write(&p, wav_bytes(rate, bits, rate)).unwrap(); // one second each
+            p.to_string_lossy().to_string()
+        };
+        let (a, b, c) = (mk("a.wav", 44100, 16), mk("b.wav", 44100, 16), mk("c.wav", 48000, 24));
+
+        let engine = AudioEngineHandle::new();
+        let (reused0, reopened0) = (crate::diagnostics::REUSED.load(Relaxed), crate::diagnostics::REOPENED.load(Relaxed));
+
+        // A then B: same rate and width, so the open card must carry over (gapless)
+        engine.set_next(Some(b.clone()));
+        engine.play(a, dev.into());
+        // the decoder runs ahead of the speakers, so the UI names the track after B as soon as the decoder is on B
+        assert!(wait_for(&engine, 8, |s| s.decoding_path.as_deref() == Some(b.as_str())), "decoder never reached B");
+        engine.set_next(Some(c.clone()));
+        assert!(wait_for(&engine, 8, |s| s.track_serial >= 2 && s.file_path.as_deref() == Some(b.as_str())), "B did not start by itself");
+        assert_eq!(crate::diagnostics::REUSED.load(Relaxed), reused0 + 1, "same-format hand-off should reuse the PCM");
+
+        // B then C: rate and width change, so the card is reopened
+        assert!(wait_for(&engine, 8, |s| s.track_serial >= 3 && s.file_path.as_deref() == Some(c.as_str())), "C did not start by itself");
+        assert!(crate::diagnostics::REOPENED.load(Relaxed) > reopened0 + 1, "format change should reopen the PCM");
+
+        // C is last: it must end cleanly
+        assert!(wait_for(&engine, 8, |s| s.ended && !s.is_playing), "last track did not end");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pause, resume, seek, skip and stop through the real engine on the fake card.
+    #[test]
+    #[ignore = "needs a fake sound card: sudo modprobe snd-dummy"]
+    fn dummy_card_controls() {
+        let dev = "hw:Dummy,0";
+        if PCM::new(dev, Direction::Playback, false).is_err() {
+            eprintln!("skipped: no {dev} (run: sudo modprobe snd-dummy)");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("rex-dummy-ctl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |name: &str, secs: u32| {
+            let p = dir.join(name);
+            std::fs::write(&p, wav_bytes(44100, 16, 44100 * secs)).unwrap();
+            p.to_string_lossy().to_string()
+        };
+        let (a, b) = (mk("a.wav", 6), mk("b.wav", 6));
+        let engine = AudioEngineHandle::new();
+
+        engine.play(a.clone(), dev.into());
+        assert!(wait_for(&engine, 5, |s| s.is_playing && s.position_seconds > 0.4), "playback did not start");
+
+        // pause: the clock must stand still, and move again after resume
+        engine.pause();
+        assert!(wait_for(&engine, 3, |s| s.is_paused), "pause not reported");
+        thread::sleep(Duration::from_millis(400)); // let the card settle (pause lands between chunks)
+        let frozen = engine.peek_status().position_seconds;
+        thread::sleep(Duration::from_millis(600));
+        assert!((engine.peek_status().position_seconds - frozen).abs() < 0.05, "clock moved while paused");
+        engine.resume();
+        assert!(wait_for(&engine, 3, |s| !s.is_paused && s.position_seconds > frozen + 0.3), "clock did not move after resume");
+
+        // seek: the clock jumps to the new place and keeps going from there
+        engine.seek(4.0);
+        assert!(wait_for(&engine, 3, |s| s.position_seconds >= 3.9 && s.position_seconds < 5.5), "seek did not land near 4.0 s");
+        assert_eq!(engine.peek_status().track_serial, 1, "a seek must not look like a new track");
+
+        // skip to another file while playing: the new file shows up, the old one is gone
+        engine.play(b.clone(), dev.into());
+        assert!(wait_for(&engine, 5, |s| s.file_path.as_deref() == Some(b.as_str()) && s.position_seconds < 2.0), "skip did not switch tracks");
+        assert_eq!(engine.peek_status().track_serial, 2);
+
+        // stop
+        engine.stop();
+        assert!(wait_for(&engine, 3, |s| !s.is_playing), "stop did not stop");
+        assert!(!engine.peek_status().ended, "a stop is not a natural end");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

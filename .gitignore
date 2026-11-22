@@ -22,3 +22,38 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Rust / Tauri build output
+target/
+src-tauri/target/
+src-tauri/gen/
+**/*.rs.bk
+*.pdb
+
+# Packaging output
+*.AppImage
+*.deb
+*.rpm
+*.pkg.tar.*
+bundle/
+
+# Secrets and local settings (never commit these)
+.env
+.env.*
+*.pem
+*.key
+config.json
+.claude/
+
+# Caches and scratch files
+.cache/
+*.tmp
+*.bak
+*.orig
+*.rej
+__pycache__/
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.directory

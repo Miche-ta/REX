@@ -3,10 +3,20 @@ const { invoke } = window.__TAURI__.core;
 const $ = (id) => document.getElementById(id);
 const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
-// localStorage can be missing or throw (private mode, blocked data): never depend on it.
+// Small settings live in the backend's config file (loaded before anything else runs, hence the top-level
+// await). Big blobs (library cache, playlist covers) stay in localStorage. localStorage can be missing or
+// throw, and the backend can be absent in a test page: both fall back quietly.
+let cfg = {}, cfgOk = false;
+try { cfg = (await invoke("get_settings")).ui || {}; cfgOk = true; } catch (_) {}
+const bigKey = (k) => k.startsWith("plcover:");
+const legacy = (k, d) => { try { return localStorage.getItem(k) ?? d; } catch (_) { return d; } };
 const store = {
-  get(k, d) { try { return localStorage.getItem(k) ?? d; } catch (_) { return d; } },
-  set(k, v) { try { localStorage.setItem(k, v); } catch (_) {} },
+  // a key never saved to the config file yet falls back to the old localStorage value
+  get(k, d) { return cfgOk && !bigKey(k) && k in cfg ? cfg[k] : legacy(k, d); },
+  set(k, v) {
+    if (cfgOk && !bigKey(k)) { cfg[k] = v; invoke("set_ui_value", { key: k, value: v }).catch(() => {}); return; }
+    try { localStorage.setItem(k, v); } catch (_) {}
+  },
 };
 
 // =====================================================================
@@ -85,10 +95,57 @@ async function loadAudioDevices() {
         </div>`;
     }).join("");
 
-    refreshVolume();
+    loadMixerControls().then(refreshVolume);
   } catch (err) {
     list.innerHTML = `<p class="empty">Could not list devices: ${esc(err)}</p>`;
   }
+}
+
+async function loadMixerControls() {
+  const sel = $("mixer-select");
+  let names = [];
+  try { names = (await invoke("list_volume_controls", { deviceId: currentDeviceId })) || []; } catch (_) {}
+  const saved = store.get(`mixer:${currentDeviceId}`, "");
+  sel.innerHTML = '<option value="">Auto</option>' + names.map((n) => `<option>${esc(n)}</option>`).join("");
+  sel.value = names.includes(saved) ? saved : "";
+  sel.disabled = !names.length;
+  await invoke("set_volume_control", { name: sel.value || null }).catch(() => {});
+}
+
+// Output buffer / period (ms): applied the next time the sound card is opened.
+async function initBufferSettings() {
+  const buf = $("buf-select"), per = $("per-select");
+  try {
+    const c = await invoke("get_settings");
+    buf.value = String(c.buffer_ms);
+    per.value = String(c.period_ms);
+  } catch (_) {}
+  const rb = $("reserve-btn");
+  let viaDbus = false;
+  const paintReserve = () => { rb.textContent = `Card release: ${viaDbus ? "D-Bus (experimental)" : "pactl"}`; rb.classList.toggle("ghost", !viaDbus); };
+  try { viaDbus = !!(await invoke("get_settings")).reserve_dbus; } catch (_) {}
+  paintReserve();
+  rb.addEventListener("click", () => { viaDbus = !viaDbus; paintReserve(); invoke("set_reserve_dbus", { enabled: viaDbus }).catch(() => {}); });
+  const send = () => invoke("set_audio_buffer", { bufferMs: Number(buf.value), periodMs: Number(per.value) })
+    .then((c) => { per.value = String(c.period_ms); }).catch(() => {});
+  buf.addEventListener("change", send);
+  per.addEventListener("change", send);
+}
+
+function initOutputTools() {
+  initBufferSettings();
+  $("mixer-select").addEventListener("change", async (e) => {
+    store.set(`mixer:${currentDeviceId}`, e.target.value);
+    await invoke("set_volume_control", { name: e.target.value || null });
+    refreshVolume(); // the slider now shows the picked control's level
+  });
+  $("hwdump-btn").addEventListener("click", async () => {
+    const pre = $("hwdump");
+    if (!pre.hidden) { pre.hidden = true; return; }
+    pre.textContent = "Reading /proc/asound…";
+    pre.hidden = false;
+    try { pre.textContent = await invoke("get_kernel_hw_params"); } catch (err) { pre.textContent = String(err); }
+  });
 }
 
 function chooseDevice(id) {
@@ -228,6 +285,29 @@ function playIndices(idxs) {
   playTrackByIndex(order[0]);
 }
 
+// Big libraries: put the first rows in the DOM and add more as you scroll near the end.
+const ROW_CHUNK = 300;
+let pendingRows = [];
+const moreObserver = new IntersectionObserver((entries) => { if (entries.some((e) => e.isIntersecting)) appendRows(); }, { rootMargin: "600px" });
+
+function paintRows(parts) {
+  pendingRows = parts.slice(ROW_CHUNK);
+  $("library-tbody").innerHTML = parts.slice(0, ROW_CHUNK).join("") +
+    (pendingRows.length ? '<tr id="lib-more"><td colspan="7" class="empty">…</td></tr>' : "");
+  moreObserver.disconnect();
+  const more = $("lib-more");
+  if (more) moreObserver.observe(more);
+}
+
+function appendRows() {
+  const more = $("lib-more");
+  if (!more) return;
+  more.insertAdjacentHTML("beforebegin", pendingRows.splice(0, ROW_CHUNK).join(""));
+  moreObserver.unobserve(more);
+  if (pendingRows.length) moreObserver.observe(more); // re-check: still in view means load the next chunk
+  else more.remove();
+}
+
 function renderLibrary() {
   const tbody = $("library-tbody");
   const grid = lib.view === "grid" && currentTrackList.length > 0;
@@ -264,14 +344,42 @@ function renderLibrary() {
 
   if (grid) return renderAlbumGrid(rows);
 
-  if (lib.view === "albums") {
+  if (lib.view === "folders") {
+    const dirOf = (p) => p.slice(0, p.lastIndexOf("/"));
+    const byDir = new Map();
+    rows.forEach((r) => {
+      const d = dirOf(r.t.file_path);
+      byDir.set(d, [...(byDir.get(d) || []), r]);
+    });
+    const parts = [...byDir.keys()].map((d) => d.split("/"));
+    // folders shared by every track are not worth showing: start below the common root
+    let root = parts[0].length;
+    for (const p of parts) { let k = 0; while (k < root && p[k] === parts[0][k]) k++; root = k; }
+    root = Math.min(root, Math.min(...parts.map((p) => p.length)) - 1);
+    // every folder on the way to a track gets a header, so whole branches can collapse
+    const nodes = new Set();
+    parts.forEach((p) => { for (let n = root + 1; n <= p.length; n++) nodes.add(p.slice(0, n).join("/")); });
+    const out = [];
+    [...nodes].sort((a, b) => a.localeCompare(b)).forEach((node) => {
+      const segs = node.split("/");
+      const hidden = segs.slice(root + 1, -1).some((_, i) => lib.collapsed.has(`dir:${segs.slice(0, root + 2 + i).join("/")}`));
+      if (hidden) return;
+      const key = `dir:${node}`;
+      const own = byDir.get(node) || [];
+      const total = [...byDir].filter(([d]) => d === node || d.startsWith(node + "/")).reduce((n, [, g]) => n + g.length, 0);
+      const closed = lib.collapsed.has(key);
+      out.push(`<tr class="group" data-group="${esc(key)}"><td colspan="7" style="padding-left:${14 + (segs.length - root - 1) * 18}px">${closed ? "+" : "\u2212"} ${esc(segs[segs.length - 1])}<span class="g-meta">${total} ${total === 1 ? "track" : "tracks"}</span></td></tr>`);
+      if (!closed) own.forEach((r, n) => out.push(row(r, n + 1)));
+    });
+    paintRows(out);
+  } else if (lib.view === "albums") {
     const groups = new Map();
     rows.forEach((r) => {
       const key = `${r.t.album}\u0000${r.t.artist}`;
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(r);
     });
-    tbody.innerHTML = [...groups].map(([key, g]) => {
+    paintRows([...groups].map(([key, g]) => {
       const mins = Math.round(g.reduce((s, r) => s + r.t.duration_seconds, 0) / 60);
       const head = `
         <tr class="group" data-group="${esc(key)}">
@@ -279,17 +387,14 @@ function renderLibrary() {
             <span class="g-meta">${esc(g[0].t.artist)} · ${g.length} ${g.length === 1 ? "track" : "tracks"} · ${mins} min</span></td>
         </tr>`;
       return head + (lib.collapsed.has(key) ? "" : g.map((r, n) => row(r, n + 1)).join(""));
-    }).join("");
+    }));
   } else {
-    tbody.innerHTML = rows.map((r, n) => row(r, n + 1)).join("");
+    paintRows(rows.map((r, n) => row(r, n + 1)));
   }
 }
 
-// Last scan per folder, so the library shows instantly on launch while a fresh scan runs behind it.
-const cacheKey = (dir) => "libcache:" + dir;
-function loadCache(dir) {
-  try { return JSON.parse(store.get(cacheKey(dir), "null")); } catch (_) { return null; }
-}
+// The backend keeps the last scan of each folder on disk, so the library shows instantly on launch
+// while a fresh scan (which only re-reads changed files) runs behind it.
 
 async function scan(dir, background = false) {
   if (!background) $("library-tbody").innerHTML = '<tr><td colspan="7" class="empty">Scanning…</td></tr>';
@@ -297,7 +402,6 @@ async function scan(dir, background = false) {
   try {
     const fresh = (await invoke("scan_music_directory", { dirPath: dir })) || [];
     currentTrackList = fresh;
-    store.set(cacheKey(dir), JSON.stringify(fresh));
     queueSrc = null; // indices changed
   } catch (_) {
     if (!background) currentTrackList = [];
@@ -374,7 +478,7 @@ async function initLibrary() {
 
   // open with the last folder, or the bundled demo files on first run
   if (savedDir) {
-    const cached = loadCache(savedDir);
+    const cached = await invoke("get_cached_library", { dirPath: savedDir }).catch(() => []);
     if (cached?.length) { currentTrackList = cached; buildOrder(); renderLibrary(); renderRecent(); }
     scan(savedDir, !!cached?.length);
   } else {
@@ -409,9 +513,9 @@ function buildOrder(first) {
 const orderPos = () => order.indexOf(currentTrackIndex);
 
 // index of the track after the current one, or -1 at the end of the queue
-function nextIndex(auto) {
-  if (auto && repeatMode === "one") return currentTrackIndex;
-  const pos = orderPos();
+function nextIndex(auto, from = currentTrackIndex) {
+  if (auto && repeatMode === "one") return from;
+  const pos = order.indexOf(from);
   if (pos >= 0 && pos < order.length - 1) return order[pos + 1];
   if (repeatMode === "all" && order.length) {
     if (shuffleOn) buildOrder();
@@ -422,8 +526,12 @@ function nextIndex(auto) {
 
 // Name the track that follows the current one, so the engine can hand over gaplessly.
 // Call whenever the current track, shuffle, repeat or the library changes.
-function syncNextHint() {
-  const n = currentTrackIndex >= 0 && !sleepAfterTrack ? nextIndex(true) : -1;
+// The engine decodes a little ahead of what you hear, so the "next track" hint is about the track the
+// decoder is on (`decodingPath`), not the one on the speakers.
+let decodingPath = null;
+function syncNextHint(fromPath = decodingPath || currentTrackList[currentTrackIndex]?.file_path) {
+  const from = currentTrackList.findIndex((t) => t.file_path === fromPath);
+  const n = from >= 0 && !sleepAfterTrack ? nextIndex(true, from) : -1;
   const filePath = n >= 0 ? currentTrackList[n]?.file_path ?? null : null;
   invoke("queue_next", { filePath }).catch(() => {});
 }
@@ -557,33 +665,85 @@ function parseLRC(text) {
   return out.sort((a, b) => a.time - b.time);
 }
 
+// Show lyric text: time-synced lines (clickable, followed by the clock) or plain paragraphs.
+function renderLyrics(raw, box) {
+  const parsed = parseLRC(raw);
+  if (!parsed.length) {
+    box.innerHTML = raw.split(/\r?\n/).filter(Boolean).map(l => `<div class="lyric-line">${esc(l)}</div>`).join("");
+    return;
+  }
+  currentLyrics = parsed;
+  box.innerHTML = parsed.map((l, i) => `<div class="lyric-line" data-idx="${i}" data-time="${l.time}">${esc(l.text)}</div>`).join("");
+  box.querySelectorAll(".lyric-line").forEach((el) => {
+    el.addEventListener("click", () => {
+      const t = Number(el.dataset.time);
+      if (!isNaN(t)) seekTo(t);
+    });
+  });
+}
+
+// Online lyrics (lrclib.net) are opt-in: the button, or the Auto-fetch switch (off by default).
+let autoLyrics = store.get("autoLyrics", "0") === "1";
+let lyricsToken = 0; // a lookup that finishes after the song changed must not paint over the new one
+
+function lyricsArgs(filePath) {
+  const t = currentTrackList.find((x) => x.file_path === filePath);
+  return t && { title: t.title, artist: t.artist, album: t.album, durationSecs: Math.round(t.duration_seconds || 0) };
+}
+
+async function fetchOnlineLyrics(filePath, force) {
+  const box = $("lyrics-content");
+  const args = lyricsArgs(filePath);
+  if (!args) return;
+  const token = ++lyricsToken;
+  box.innerHTML = '<p class="lyrics-empty">Asking lrclib.net…</p>';
+  try {
+    const text = await invoke("fetch_online_lyrics", { ...args, force });
+    if (token !== lyricsToken) return;
+    if (text) renderLyrics(text, box);
+    else box.innerHTML = '<p class="lyrics-empty">lrclib.net has no lyrics for this song.</p>';
+  } catch (err) {
+    if (token === lyricsToken) box.innerHTML = `<p class="lyrics-empty">${esc(String(err))}</p>`;
+  }
+}
+
 async function loadLyrics(filePath) {
   currentLyrics = [];
   currentLyricIdx = -1;
+  const token = ++lyricsToken;
   const box = $("lyrics-content");
   box.innerHTML = '<p class="lyrics-empty">Searching lyrics...</p>';
   try {
-    const raw = await invoke("get_lyrics", { filePath });
-    if (!raw) {
-      box.innerHTML = '<p class="lyrics-empty">No lyrics found for this track (.lrc or metadata)</p>';
-      return;
-    }
-    const parsed = parseLRC(raw);
-    if (!parsed.length) {
-      box.innerHTML = raw.split(/\r?\n/).filter(Boolean).map(l => `<div class="lyric-line">${esc(l)}</div>`).join("");
-      return;
-    }
-    currentLyrics = parsed;
-    box.innerHTML = parsed.map((l, i) => `<div class="lyric-line" data-idx="${i}" data-time="${l.time}">${esc(l.text)}</div>`).join("");
-    box.querySelectorAll(".lyric-line").forEach((el) => {
-      el.addEventListener("click", () => {
-        const t = Number(el.dataset.time);
-        if (!isNaN(t)) seekTo(t);
-      });
-    });
+    const raw = await invoke("get_lyrics", { filePath }); // .lrc files and embedded tags first
+    if (token !== lyricsToken) return;
+    if (raw) return renderLyrics(raw, box);
+
+    const args = lyricsArgs(filePath);
+    const cached = args && (await invoke("get_online_lyrics_cached", args).catch(() => null)); // cache only, no network
+    if (token !== lyricsToken) return;
+    if (cached) return renderLyrics(cached, box);
+    if (autoLyrics && args) return fetchOnlineLyrics(filePath, false);
+
+    box.innerHTML = '<p class="lyrics-empty">No lyrics found for this song (.lrc file or tags).' +
+      '<span class="lyrics-note">Use Fetch online below to look it up on lrclib.net.</span></p>';
   } catch (_) {
-    box.innerHTML = '<p class="lyrics-empty">No lyrics available</p>';
+    if (token === lyricsToken) box.innerHTML = '<p class="lyrics-empty">No lyrics available</p>';
   }
+}
+
+function initLyricsControls() {
+  const auto = $("lyrics-auto-btn");
+  const paint = () => { auto.textContent = `Auto-fetch: ${autoLyrics ? "on" : "off"}`; auto.classList.toggle("ghost", !autoLyrics); };
+  paint();
+  auto.addEventListener("click", () => {
+    autoLyrics = !autoLyrics;
+    store.set("autoLyrics", autoLyrics ? "1" : "0");
+    paint();
+  });
+  $("lyrics-fetch-btn").addEventListener("click", () => {
+    const path = currentTrackList[currentTrackIndex]?.file_path;
+    if (path) fetchOnlineLyrics(path, true);
+  });
 }
 
 function updateActiveLyric(pos) {
@@ -635,7 +795,8 @@ async function playTrackByIndex(idx) {
   renderUpNext();
   loadCover(track.file_path);
   loadLyrics(track.file_path);
-  syncNextHint();
+  decodingPath = track.file_path;
+  syncNextHint(track.file_path);
 
   try {
     await invoke("play_track", { filePath: track.file_path, deviceId: currentDeviceId });
@@ -759,6 +920,7 @@ function setIdleStatus() {
   $("signal-dot").className = "mark";
   $("signal-hud-text").textContent = "Idle";
   $("tp-rate").textContent = "—";
+  $("sigpath").hidden = true;
   setReadout(null);
 }
 
@@ -786,6 +948,21 @@ function showStatus(s) {
     $("volume-slider").disabled ? "system" : "DAC hardware",
   ]);
   $("tp-rate").textContent = `${k(hz)} kHz · ${fmt}`;
+
+  // signal path: source -> processing -> output -> volume; accent when untouched, amber when anything alters it
+  const ext = (s.file_path || "").split(".").pop().toUpperCase();
+  const rgActive = rgOn && rgGain < 0;
+  const notes = [];
+  if (s.sample_rate !== hz) notes.push(`resampled ${k(s.sample_rate)}\u2192${k(hz)} kHz`);
+  else if (!s.is_bit_perfect) notes.push("shared mixer");
+  if (rgActive) notes.push(`ReplayGain ${rgGain.toFixed(1)} dB`);
+  $("sp-src").textContent = `${ext} ${s.bit_depth}/${k(s.sample_rate)}`;
+  const mid = $("sp-proc");
+  mid.textContent = notes.length ? notes.join(" + ") : "bit-perfect, no DSP";
+  mid.className = `sp-node sp-mid ${notes.length ? "warn" : "ok"}`;
+  $("sp-out").textContent = `${s.active_device_id} ${fmt}`;
+  $("sp-vol").textContent = $("volume-slider").disabled ? "system volume" : "DAC volume";
+  $("sigpath").hidden = false;
   const resampled = s.sample_rate !== hz;
   $("signal-dot").className = `mark ${s.is_bit_perfect ? "ok" : resampled ? "info" : "warn"}`;
   $("signal-hud-text").textContent = s.is_bit_perfect
@@ -936,6 +1113,7 @@ function renderRecent() {
 let endedHandled = false;
 let wasPlaying = false;
 let lastSerial = 0;
+let lastDecoderSerial = 0;
 
 // Tell the desktop (media widgets, lock screen) what is playing; only when something changed.
 let lastMpris = "";
@@ -953,8 +1131,7 @@ function pushMpris(status) {
   }).catch(() => {});
 }
 
-function startStatusPolling() {
-  setInterval(async () => {
+async function pollStatus() {
     try {
       const status = await invoke("get_playback_status");
       if (!status) return;
@@ -991,7 +1168,13 @@ function startStatusPolling() {
         }
         noteRecent(status.file_path);
         renderUpNext();
-        syncNextHint();
+      }
+
+      // The decoder started a track (maybe ahead of what is audible): name the one after it.
+      if (status.decoder_serial !== lastDecoderSerial) {
+        lastDecoderSerial = status.decoder_serial;
+        decodingPath = status.decoding_path;
+        syncNextHint(decodingPath);
       }
       isPlaying = status.is_playing;
       isPaused = status.is_paused;
@@ -1022,7 +1205,17 @@ function startStatusPolling() {
       $("mini-artist").textContent = status.artist;
       showStatus(status);
     } catch (_) {}
-  }, 100);
+}
+
+// The engine announces track starts, pauses and ends ("player-event"), so the UI reacts at once.
+// The timer is only a safety net and the source of the VU peaks: fast while the VU meter is on screen.
+function startStatusPolling() {
+  const tick = async () => {
+    await pollStatus();
+    setTimeout(tick, $("vu-panel").hidden ? 500 : 100);
+  };
+  tick();
+  if (window.__TAURI__?.event?.listen) window.__TAURI__.event.listen("player-event", pollStatus);
 }
 
 // =====================================================================
@@ -1053,6 +1246,17 @@ function initLogPanel() {
     allLogs = [];
     logSig = "";
     renderLogs();
+  });
+
+  $("copy-report-btn").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    try {
+      await navigator.clipboard.writeText(await invoke("get_diagnostics"));
+      btn.textContent = "Copied";
+    } catch (_) {
+      btn.textContent = "Copy failed";
+    }
+    setTimeout(() => { btn.textContent = "Copy report"; }, 1500);
   });
 
   $("copy-logs-btn").addEventListener("click", async (e) => {
@@ -1091,6 +1295,28 @@ function initLogPanel() {
 // =====================================================================
 // Keyboard
 // =====================================================================
+// j/k move focus through whatever list the current page shows (Enter plays), g g / G jump to the ends.
+const listItems = () => [...document.querySelectorAll(
+  ".view-section.active tr.track-row, .view-section.active #pl-tracks .up-next-row:not(.missing), .view-section.active .tile")];
+
+function focusItem(items, i) {
+  if (!items.length) return;
+  items[i].focus();
+  items[i].scrollIntoView({ block: "nearest" });
+}
+
+function stepList(d) {
+  const items = listItems();
+  const cur = items.indexOf(document.activeElement);
+  focusItem(items, cur < 0 ? (d > 0 ? 0 : items.length - 1) : Math.max(0, Math.min(items.length - 1, cur + d)));
+}
+
+let lastG = 0;
+function gChord() {
+  const now = Date.now();
+  if (now - lastG < 600) { lastG = 0; focusItem(listItems(), 0); } else lastG = now;
+}
+
 function initShortcuts() {
   const dlg = $("shortcuts");
   $("help-btn").addEventListener("click", () => dlg.showModal());
@@ -1115,6 +1341,10 @@ function initShortcuts() {
       p: prevTrack,
       s: toggleShuffle,
       r: cycleRepeat,
+      j: () => stepList(1),
+      k: () => stepList(-1),
+      g: gChord,
+      G: () => { while ($("lib-more")) appendRows(); const it = listItems(); focusItem(it, it.length - 1); },
       "/": () => { showView("library"); $("library-search").focus(); },
       "?": () => dlg.showModal(),
     };
@@ -1145,6 +1375,24 @@ function initMpris() {
 // =====================================================================
 // Playlists (plain .m3u files) and the library right-click menu
 // =====================================================================
+// Smart playlists: rules evaluated live against the library, never stored.
+const SMART = [
+  { id: "hires", name: "Hi-res (96 kHz and up)", test: (t) => t.sample_rate >= 96000 },
+  { id: "bit24", name: "24-bit and up", test: (t) => t.bit_depth >= 24 },
+  { id: "cd", name: "CD quality (16/44.1)", test: (t) => t.bit_depth === 16 && t.sample_rate === 44100 },
+];
+
+function openSmart(id) {
+  const sp = SMART.find((x) => x.id === id);
+  if (!sp) return;
+  openPl = { name: sp.name, smart: true, paths: currentTrackList.filter(sp.test).map((t) => t.file_path) };
+  showView("playlists");
+  $("pl-add").value = "";
+  $("pl-results").innerHTML = "";
+  paintRail();
+  renderPlaylistDetail();
+}
+
 let playlistNames = [];
 let openPl = null; // { name, paths } while a playlist page is open
 
@@ -1157,9 +1405,10 @@ async function refreshNames() {
 function paintRail() {
   const box = $("rail-playlists");
   if (!box) return;
-  box.innerHTML = playlistNames.length
-    ? playlistNames.map((n) => `<button class="pl-item ${openPl?.name === n ? "active" : ""}" data-name="${esc(n)}" title="${esc(n)}">${esc(n)}</button>`).join("")
-    : '<p class="rail-empty">None yet. Press + to create one.</p>';
+  box.innerHTML = (playlistNames.length
+    ? playlistNames.map((n) => `<button class="pl-item ${openPl && !openPl.smart && openPl.name === n ? "active" : ""}" data-name="${esc(n)}" title="${esc(n)}">${esc(n)}</button>`).join("")
+    : '<p class="rail-empty">None yet. Press + to create one.</p>')
+    + SMART.map((x) => `<button class="pl-item smart ${openPl?.smart && openPl.name === x.name ? "active" : ""}" data-smart="${x.id}" title="${esc(x.name)}">${esc(x.name)}</button>`).join("");
 }
 
 function toast(text, actionLabel, onAction) {
@@ -1190,7 +1439,12 @@ async function openPlaylist(name) {
 
 function renderPlaylistDetail() {
   const byPath = new Map(currentTrackList.map((t, i) => [t.file_path, i]));
+  const smart = !!openPl.smart; // smart lists are read-only: no rename, delete, add or remove
+  $("pl-detail").classList.toggle("smart", smart);
+  $("pl-del").hidden = smart;
+  document.querySelector(".pl-add").hidden = smart;
   $("pl-title").textContent = openPl.name;
+  $("pl-title").title = smart ? "Smart playlist: built from your library" : "Click to rename";
   const known = openPl.paths.map((p) => currentTrackList[byPath.get(p)]).filter(Boolean);
   const mins = Math.round(known.reduce((sum, t) => sum + t.duration_seconds, 0) / 60);
   const n = openPl.paths.length;
@@ -1211,8 +1465,20 @@ function renderPlaylistDetail() {
 // Cover: up to four distinct album covers as a 2x2 mosaic, one if fewer, a dashed square when there are none.
 const plCoverCache = new Map();
 let plCoverToken = 0;
+const coverKey = (name) => `plcover:${name}`;
+
 async function paintPlaylistCover(paths) {
   const token = ++plCoverToken;
+  const box = $("pl-cover");
+  const custom = openPl.smart ? "" : store.get(coverKey(openPl.name), "");
+  box.classList.toggle("locked", !!openPl.smart);
+  $("pl-cover-rm").hidden = !custom;
+  box.title = openPl.smart ? "" : "Click, or drop an image, to set the cover";
+  if (custom) { // a picked image beats the automatic mosaic
+    box.className = "pl-cover one";
+    box.innerHTML = `<img src="${custom}" alt="">`;
+    return;
+  }
   const urls = [];
   for (const p of paths.slice(0, 16)) {
     if (urls.length >= 4) break;
@@ -1221,9 +1487,10 @@ async function paintPlaylistCover(paths) {
     if (u && !urls.includes(u)) urls.push(u);
   }
   if (token !== plCoverToken) return; // the page changed while covers were loading
-  const box = $("pl-cover");
-  box.className = "pl-cover" + (!urls.length ? " empty" : urls.length < 4 ? " one" : "");
-  box.innerHTML = (urls.length < 4 ? urls.slice(0, 1) : urls).map((u) => `<img src="${u}" alt="">`).join("");
+  box.className = "pl-cover" + (!urls.length ? " empty" : urls.length < 4 ? " one" : "") + (openPl.smart ? " locked" : "");
+  box.innerHTML = urls.length
+    ? (urls.length < 4 ? urls.slice(0, 1) : urls).map((u) => `<img src="${u}" alt="">`).join("")
+    : openPl.smart ? "" : '<span class="pl-cover-hint">Add cover<small>click or drop an image</small></span>';
 }
 
 // Inline song search: type, click a result, it is added; the field keeps focus for the next one.
@@ -1277,7 +1544,28 @@ async function createPlaylist() {
   renameTitle();
 }
 
+// Crop an image file to a square, shrink it, and keep it as this playlist's cover.
+function setCoverFromFile(file) {
+  if (!file || !file.type.startsWith("image/") || !openPl || openPl.smart) return;
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+  img.onload = () => {
+    const side = Math.min(img.width, img.height), size = Math.min(480, side);
+    const cv = document.createElement("canvas");
+    cv.width = cv.height = size;
+    cv.getContext("2d").drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, size, size);
+    URL.revokeObjectURL(url);
+    const data = cv.toDataURL("image/jpeg", 0.85);
+    store.set(coverKey(openPl.name), data);
+    if (store.get(coverKey(openPl.name), "") !== data) toast("Could not save the cover (storage is full or blocked)");
+    paintPlaylistCover(openPl.paths);
+  };
+  img.onerror = () => { URL.revokeObjectURL(url); toast("That file is not an image the app can read"); };
+  img.src = url;
+}
+
 function renameTitle() {
+  if (openPl.smart) return;
   const h = $("pl-title");
   const old = openPl.name;
   const input = document.createElement("input");
@@ -1298,6 +1586,8 @@ function renameTitle() {
     if (!commit || !name || name === old) return;
     try {
       await invoke("rename_playlist", { old, new: name });
+      const cover = store.get(coverKey(old), ""); // the cover follows the new name
+      if (cover) { store.set(coverKey(name), cover); try { localStorage.removeItem(coverKey(old)); } catch (_) {} }
       await refreshNames();
       await openPlaylist(name);
     } catch (err) { toast(String(err)); }
@@ -1438,7 +1728,8 @@ function initPlaylists() {
   });
   $("rail-playlists").addEventListener("click", (e) => {
     const b = e.target.closest(".pl-item");
-    if (b) openPlaylist(b.dataset.name);
+    if (!b) return;
+    if (b.dataset.smart) openSmart(b.dataset.smart); else openPlaylist(b.dataset.name);
   });
 
   // drag a song from the library onto a playlist in the sidebar
@@ -1467,6 +1758,19 @@ function initPlaylists() {
   });
 
   $("pl-title").addEventListener("click", renameTitle);
+
+  const cover = $("pl-cover"), picker = $("pl-cover-file");
+  const choose = () => { if (openPl && !openPl.smart) picker.click(); };
+  cover.addEventListener("click", choose);
+  cover.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); choose(); } });
+  picker.addEventListener("change", () => { setCoverFromFile(picker.files[0]); picker.value = ""; });
+  cover.addEventListener("dragover", (e) => { if (openPl && !openPl.smart) { e.preventDefault(); cover.classList.add("over"); } });
+  cover.addEventListener("dragleave", () => cover.classList.remove("over"));
+  cover.addEventListener("drop", (e) => { e.preventDefault(); cover.classList.remove("over"); setCoverFromFile(e.dataTransfer.files[0]); });
+  $("pl-cover-rm").addEventListener("click", () => {
+    try { localStorage.removeItem(coverKey(openPl.name)); } catch (_) {}
+    paintPlaylistCover(openPl.paths);
+  });
   $("pl-add").addEventListener("input", renderPlaylistResults);
   $("pl-results").addEventListener("click", async (e) => {
     const row = e.target.closest(".up-next-row");
@@ -1482,11 +1786,15 @@ function initPlaylists() {
   });
   $("pl-play").addEventListener("click", () => playPlaylist());
 
+  $("pl-tracks").addEventListener("keydown", (e) => {
+    const row = e.target.closest(".up-next-row");
+    if (e.key === "Enter" && row && !row.classList.contains("missing")) playPlaylist(row.dataset.path);
+  });
   $("pl-tracks").addEventListener("click", async (e) => {
     const row = e.target.closest(".up-next-row");
     if (!row) return;
     const path = row.dataset.path;
-    if (e.target.closest(".un-x")) {
+    if (e.target.closest(".un-x") && !openPl.smart) {
       const paths = openPl.paths.filter((p) => p !== path);
       await invoke("save_playlist", { name: openPl.name, paths });
       openPl.paths = paths;
@@ -1505,7 +1813,10 @@ function initPlaylists() {
     }
     clearTimeout(delTimer);
     b.dataset.sure = ""; b.textContent = "Delete playlist";
-    try { await invoke("delete_playlist", { name: openPl.name }); } catch (err) { toast(String(err)); }
+    try {
+      await invoke("delete_playlist", { name: openPl.name });
+      try { localStorage.removeItem(coverKey(openPl.name)); } catch (_) {}
+    } catch (err) { toast(String(err)); }
     showView("library");
     refreshNames();
   });
@@ -1526,11 +1837,13 @@ function initPlaylists() {
   refreshNames();
 }
 
-window.addEventListener("DOMContentLoaded", () => {
+function boot() {
   initNavigation();
   initThemeEngine();
   initVisualTabs();
+  initLyricsControls();
   initDevices();
+  initOutputTools();
   loadAudioDevices();
   initLibrary();
   initContextMenu();
@@ -1545,4 +1858,7 @@ window.addEventListener("DOMContentLoaded", () => {
   initMpris();
   startStatusPolling();
   requestAnimationFrame(animateProgress);
-});
+}
+
+// the module may finish evaluating after DOMContentLoaded (top-level await above)
+if (document.readyState === "loading") addEventListener("DOMContentLoaded", boot); else boot();

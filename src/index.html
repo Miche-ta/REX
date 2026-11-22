@@ -79,6 +79,10 @@
                 <div class="lyrics-scroll" id="lyrics-content">
                   <p class="lyrics-empty">No lyrics loaded</p>
                 </div>
+                <div class="lyrics-foot">
+                  <button id="lyrics-fetch-btn" class="btn ghost" title="Looks the song up on lrclib.net. Sends its title, artist, album and length.">Fetch online</button>
+                  <button id="lyrics-auto-btn" class="btn ghost" title="Look up lyrics on lrclib.net automatically when a song has none. Off by default.">Auto-fetch: off</button>
+                </div>
               </div>
             </div>
 
@@ -87,6 +91,13 @@
               <h1 class="track-title" id="np-title">Nothing playing</h1>
               <p class="track-artist" id="np-artist">Pick a track in the library</p>
               <p class="track-album" id="np-album"></p>
+
+              <div class="sigpath" id="sigpath" hidden>
+                <span class="sp-node" id="sp-src"></span><span class="sp-arrow"></span>
+                <span class="sp-node sp-mid" id="sp-proc"></span><span class="sp-arrow"></span>
+                <span class="sp-node" id="sp-out"></span><span class="sp-arrow"></span>
+                <span class="sp-node" id="sp-vol"></span>
+              </div>
 
               <dl class="readout">
                 <dt>Source</dt><dd id="ro-source">—</dd>
@@ -123,6 +134,7 @@
             <div class="seg" id="lib-view" role="group" aria-label="Grouping">
               <button data-view="tracks" class="on">Tracks</button>
               <button data-view="albums">Albums</button>
+              <button data-view="folders">Folders</button>
               <button data-view="grid">Grid</button>
             </div>
           </div>
@@ -159,13 +171,15 @@
         <section id="playlists-view" class="view-section">
           <div id="pl-detail">
             <div class="pl-hero">
-              <div class="pl-cover empty" id="pl-cover"></div>
+              <div class="pl-cover empty" id="pl-cover" role="button" tabindex="0"></div>
+              <input type="file" id="pl-cover-file" accept="image/*" hidden />
               <div class="pl-meta">
                 <span class="pl-kind">Playlist</span>
                 <h2 id="pl-title" class="pl-title" title="Click to rename" tabindex="0"></h2>
                 <p class="sub" id="pl-count"></p>
                 <div class="bar tight pl-actions">
                   <button id="pl-play" class="btn">Play</button>
+                  <button id="pl-cover-rm" class="btn ghost" hidden>Remove cover</button>
                   <button id="pl-del" class="btn ghost">Delete playlist</button>
                 </div>
               </div>
@@ -190,6 +204,29 @@
               <button id="rescan-hw-btn" class="btn">Rescan</button>
             </div>
           </div>
+          <div class="bar mixer-row">
+            <label class="out"><span>Volume control</span>
+              <select id="mixer-select" class="select-input" aria-label="Mixer control for the volume slider"><option value="">Auto</option></select>
+            </label>
+            <button id="hwdump-btn" class="btn ghost" title="Raw ALSA hw_params and USB stream descriptor from /proc/asound">Kernel hw_params</button>
+          </div>
+          <div class="bar mixer-row">
+            <label class="out"><span>Buffer</span>
+              <select id="buf-select" class="select-input" aria-label="Output buffer size">
+                <option value="200">200 ms</option><option value="500">500 ms</option>
+                <option value="1000">1000 ms</option><option value="2000">2000 ms</option>
+              </select>
+            </label>
+            <label class="out"><span>Period</span>
+              <select id="per-select" class="select-input" aria-label="Output period size">
+                <option value="10">10 ms</option><option value="20">20 ms</option>
+                <option value="50">50 ms</option><option value="100">100 ms</option>
+              </select>
+            </label>
+            <button id="reserve-btn" class="btn ghost" title="How the app takes the card from PipeWire. pactl suspends its outputs (default). D-Bus asks it to release the card with the standard ReserveDevice1 protocol and then holds it; experimental, falls back to pactl.">Card release: pactl</button>
+            <span class="sub">Takes effect when playback next opens the device (stop, then play). Smaller periods mean more interrupts.</span>
+          </div>
+          <pre id="hwdump" class="dump" hidden></pre>
           <div class="devices" id="hw-devices-grid"><p class="empty">Scanning…</p></div>
         </section>
 
@@ -248,6 +285,7 @@
                 <button data-level="error" class="on">Error</button>
               </div>
               <button id="copy-logs-btn" class="btn ghost">Copy</button>
+              <button id="copy-report-btn" class="btn ghost" title="Versions, settings, health counters, device state, recent log and kernel USB lines, as text for a bug report">Copy report</button>
               <button id="clear-logs-btn" class="btn ghost">Clear</button>
             </div>
           </div>
@@ -317,6 +355,8 @@
         <dt>s  r</dt><dd>Shuffle / repeat</dd>
         <dt>/</dt><dd>Search library</dd>
         <dt>1 – 5</dt><dd>Switch view</dd>
+        <dt>j  k</dt><dd>Move in lists (Enter plays)</dd>
+        <dt>g g  G</dt><dd>Top / bottom of list</dd>
         <dt>Ctrl K</dt><dd>Search everything</dd>
         <dt>?</dt><dd>This list</dd>
       </dl>

@@ -111,8 +111,8 @@ fn extract_track_info(path: &Path, ext: &str) -> Option<TrackInfo> {
 }
 
 /// Cover art as a data URL: embedded picture first, then cover/folder/front image beside the file.
-pub fn get_cover(file_path: &str) -> Option<String> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
+/// Cover image bytes and mime type: embedded picture first, else cover/folder/front/album image beside the file.
+pub fn cover_bytes(file_path: &str) -> Option<(Vec<u8>, String)> {
     let path = Path::new(file_path);
     let mime_of = |p: &Path| match p.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref() {
         Some("png") => "image/png",
@@ -127,7 +127,7 @@ pub fn get_cover(file_path: &str) -> Option<String> {
         if let Some(rev) = format.metadata().current() {
             if let Some(v) = rev.media.visuals.first() {
                 let mime = v.media_type.clone().unwrap_or_else(|| "image/jpeg".into());
-                return Some(format!("data:{};base64,{}", mime, STANDARD.encode(&v.data)));
+                return Some((v.data.to_vec(), mime));
             }
         }
     }
@@ -137,7 +137,45 @@ pub fn get_cover(file_path: &str) -> Option<String> {
         for ext in ["jpg", "jpeg", "png"] {
             let img = dir.join(format!("{name}.{ext}"));
             if let Ok(bytes) = fs::read(&img) {
-                return Some(format!("data:{};base64,{}", mime_of(&img), STANDARD.encode(bytes)));
+                return Some((bytes, mime_of(&img).to_string()));
+            }
+        }
+    }
+    None
+}
+
+pub fn get_cover(file_path: &str) -> Option<String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let (bytes, mime) = cover_bytes(file_path)?;
+    Some(format!("data:{};base64,{}", mime, STANDARD.encode(bytes)))
+}
+
+pub fn get_lyrics(file_path: &str) -> Option<String> {
+    let path = Path::new(file_path);
+    // 1. Same directory, same file stem with .lrc extension
+    let lrc_path = path.with_extension("lrc");
+    if let Ok(content) = fs::read_to_string(&lrc_path) {
+        return Some(content);
+    }
+    // 2. Also check lyrics.lrc in the parent folder
+    if let Some(dir) = path.parent() {
+        let folder_lrc = dir.join("lyrics.lrc");
+        if let Ok(content) = fs::read_to_string(&folder_lrc) {
+            return Some(content);
+        }
+    }
+    // 3. Check embedded metadata tags
+    let file = fs::File::open(path).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) { hint.with_extension(ext); }
+    if let Ok(mut format) = symphonia::default::get_probe().probe(&hint, mss, FormatOptions::default(), MetadataOptions::default()) {
+        if let Some(rev) = format.metadata().current() {
+            for tag in &rev.media.tags {
+                let key = tag.raw.key.to_lowercase();
+                if key == "lyrics" || key == "unsyncedlyrics" || key == "unsynced lyrics" || key.starts_with("uslt") {
+                    return Some(tag.raw.value.to_string());
+                }
             }
         }
     }

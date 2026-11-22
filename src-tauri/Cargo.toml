@@ -26,6 +26,7 @@ alsa = "0.12.1"
 base64 = "0.23"
 symphonia = { version = "0.6.1", features = ["all"] }
 rubato = "0.16"
+zbus = "5"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

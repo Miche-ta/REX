@@ -26,6 +26,10 @@
         <button class="nav-item" data-view="hardware">Output <kbd>3</kbd></button>
         <button class="nav-item" data-view="themes">Themes <kbd>4</kbd></button>
         <button class="nav-item" data-view="terminal">Terminal <kbd>5</kbd></button>
+
+        <div class="rail-group"><span>Playlists</span><button id="pl-new" class="rail-plus" title="New playlist" aria-label="New playlist">+</button></div>
+        <div id="rail-playlists" class="rail-playlists"></div>
+        <button class="rail-help" id="sleep-btn" title="Stop playback after a delay, or after this track">Sleep timer <kbd>off</kbd></button>
         <button class="rail-help" id="help-btn">Shortcuts <kbd>?</kbd></button>
       </nav>
 
@@ -33,10 +37,48 @@
         <!-- Now playing -->
         <section id="now-playing-view" class="view-section active">
           <div class="np">
-            <div class="art" id="art-wrapper" title="Click to switch between disc and cover">
-              <img id="cover-img" alt="Album cover" hidden />
-              <div class="disc" id="vinyl-disc">
-                <div class="vinyl-center"><span>rex-music</span></div>
+            <div class="visual-pane">
+              <div class="seg vtabs" id="vtabs" role="group" aria-label="Visualizer mode">
+                <button data-vis="art" class="on">Art</button>
+                <button data-vis="vu">VU Meter</button>
+                <button data-vis="lyrics">Lyrics</button>
+              </div>
+              <div class="art" id="art-wrapper" title="Click to switch between disc and cover">
+                <img id="cover-img" alt="Album cover" hidden />
+                <div class="disc" id="vinyl-disc">
+                  <div class="vinyl-center"><span>rex-music</span></div>
+                </div>
+              </div>
+              <div class="vu-panel" id="vu-panel" hidden>
+                <div class="vu-meter">
+                  <div class="vu-scale">
+                    <div class="vu-arc"></div>
+                    <div class="vu-ticks">
+                      <span>-20</span><span>-10</span><span>-7</span><span>-5</span><span>-3</span><span>0</span><span class="vu-red">+3</span>
+                    </div>
+                    <span class="vu-tag">CH L</span>
+                    <span class="vu-db">VU · dB</span>
+                  </div>
+                  <div class="vu-needle-box" id="vu-needle-left"><div class="vu-needle-line"></div></div>
+                  <div class="vu-cap"></div>
+                </div>
+                <div class="vu-meter">
+                  <div class="vu-scale">
+                    <div class="vu-arc"></div>
+                    <div class="vu-ticks">
+                      <span>-20</span><span>-10</span><span>-7</span><span>-5</span><span>-3</span><span>0</span><span class="vu-red">+3</span>
+                    </div>
+                    <span class="vu-tag">CH R</span>
+                    <span class="vu-db">VU · dB</span>
+                  </div>
+                  <div class="vu-needle-box" id="vu-needle-right"><div class="vu-needle-line"></div></div>
+                  <div class="vu-cap"></div>
+                </div>
+              </div>
+              <div class="lyrics-panel" id="lyrics-panel" hidden>
+                <div class="lyrics-scroll" id="lyrics-content">
+                  <p class="lyrics-empty">No lyrics loaded</p>
+                </div>
               </div>
             </div>
 
@@ -59,8 +101,13 @@
           </div>
 
           <div class="queue">
-            <div class="queue-head"><h2>Queue</h2><span id="up-next-summary"></span></div>
+            <div class="queue-head"><h2>Queue</h2><span id="up-next-summary"></span><button id="queue-save" class="btn ghost">Save as playlist</button></div>
             <div id="up-next-list"><p class="up-next-empty">Empty.</p></div>
+          </div>
+
+          <div class="queue" id="recent-box" hidden>
+            <div class="queue-head"><h2>Recently played</h2></div>
+            <div id="recent-list"></div>
           </div>
         </section>
 
@@ -76,13 +123,15 @@
             <div class="seg" id="lib-view" role="group" aria-label="Grouping">
               <button data-view="tracks" class="on">Tracks</button>
               <button data-view="albums">Albums</button>
+              <button data-view="grid">Grid</button>
             </div>
           </div>
-          <div class="bar">
+          <div class="bar wrap">
             <input type="text" id="scan-path-input" class="field grow mono" placeholder="Folder to scan" />
             <button id="scan-folder-btn" class="btn">Scan</button>
-            <button id="scan-demo-btn" class="btn ghost">Demo files</button>
           </div>
+
+          <div id="lib-grid" class="grid" hidden></div>
 
           <table class="tracks">
             <colgroup>
@@ -106,6 +155,29 @@
           </table>
         </section>
 
+        <!-- Playlist page -->
+        <section id="playlists-view" class="view-section">
+          <div id="pl-detail">
+            <div class="pl-hero">
+              <div class="pl-cover empty" id="pl-cover"></div>
+              <div class="pl-meta">
+                <span class="pl-kind">Playlist</span>
+                <h2 id="pl-title" class="pl-title" title="Click to rename" tabindex="0"></h2>
+                <p class="sub" id="pl-count"></p>
+                <div class="bar tight pl-actions">
+                  <button id="pl-play" class="btn">Play</button>
+                  <button id="pl-del" class="btn ghost">Delete playlist</button>
+                </div>
+              </div>
+            </div>
+            <div class="pl-add">
+              <input type="search" id="pl-add" class="field" placeholder="Add songs: search title, artist or album" />
+              <div id="pl-results"></div>
+            </div>
+            <div id="pl-tracks"></div>
+          </div>
+        </section>
+
         <!-- Output devices -->
         <section id="hardware-view" class="view-section">
           <div class="head">
@@ -113,7 +185,10 @@
               <h2>Output devices</h2>
               <p class="sub">Direct <code>hw:</code> devices skip the system mixer and resampler.</p>
             </div>
-            <button id="rescan-hw-btn" class="btn">Rescan</button>
+            <div class="bar tight">
+              <button id="rg-btn" class="btn ghost" title="Lower the DAC volume for loud masters (never raises it). Needs ReplayGain tags and a mixer that reports dB.">ReplayGain: off</button>
+              <button id="rescan-hw-btn" class="btn">Rescan</button>
+            </div>
           </div>
           <div class="devices" id="hw-devices-grid"><p class="empty">Scanning…</p></div>
         </section>
@@ -185,6 +260,7 @@
       <div class="tp-left">
         <div class="mini-title" id="mini-title">Nothing playing</div>
         <div class="mini-artist" id="mini-artist"></div>
+        <div class="mini-next" id="mini-next"></div>
       </div>
 
       <div class="tp-center">
@@ -226,6 +302,11 @@
       </div>
     </footer>
 
+    <dialog id="palette">
+      <input type="search" id="palette-input" class="field" placeholder="Search songs, albums, playlists" autocomplete="off" />
+      <div id="palette-results"></div>
+    </dialog>
+
     <dialog id="shortcuts">
       <h2>Keyboard shortcuts</h2>
       <dl>
@@ -236,6 +317,7 @@
         <dt>s  r</dt><dd>Shuffle / repeat</dd>
         <dt>/</dt><dd>Search library</dd>
         <dt>1 – 5</dt><dd>Switch view</dd>
+        <dt>Ctrl K</dt><dd>Search everything</dd>
         <dt>?</dt><dd>This list</dd>
       </dl>
       <form method="dialog"><button class="btn">Close</button></form>

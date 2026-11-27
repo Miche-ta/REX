@@ -1,0 +1,33 @@
+app-id: io.github.micheta.rex-music
+runtime: org.gnome.Platform
+runtime-version: '47'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: rex-music
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --device=all
+  - --filesystem=xdg-music:ro
+  - --talk-name=org.freedesktop.RealtimeKit1
+  - --talk-name=org.freedesktop.ReserveDevice1.*
+  - --own-name=org.mpris.MediaPlayer2.rex_music
+modules:
+  - name: rex-music
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/rex-music/cargo
+    build-commands:
+      - cargo build --manifest-path src-tauri/Cargo.toml --release
+      - install -Dm755 src-tauri/target/release/rex-music /app/bin/rex-music
+      - install -Dm644 packaging/linux/rex-music.desktop /app/share/applications/io.github.micheta.rex-music.desktop
+      - install -Dm644 src-tauri/icons/128x128.png /app/share/icons/hicolor/128x128/apps/io.github.micheta.rex-music.png
+    sources:
+      - type: dir
+        path: ../..

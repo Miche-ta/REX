@@ -35,7 +35,18 @@ src-tauri/gen/
 *.deb
 *.rpm
 *.pkg.tar.*
+*.dmg
+*.msi
+*.exe
+*.zip
+*.tar.gz
+*.tar.zst
+*.tar.xz
 bundle/
+packaging/aur/pkg/
+packaging/aur/src/
+packaging/flatpak/build-dir/
+.flatpak-builder/
 
 # Secrets and local settings (never commit these)
 .env

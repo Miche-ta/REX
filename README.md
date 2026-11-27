@@ -26,6 +26,8 @@ cd src-tauri
 cargo test
 ```
 
+For building installers and packages (AppImage, `.deb`, `.rpm`, AUR `PKGBUILD`, Flatpak, Windows MSI/NSIS, macOS `.dmg`), see [packaging/README.md](packaging/README.md).
+
 The frontend lives in `src/` and has no build step: edit `index.html`, `styles.css`, or `main.js` and reload.
 
 ## How output works

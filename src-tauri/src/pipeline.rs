@@ -16,8 +16,6 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use alsa::pcm::{Access, HwParams, PCM};
-use alsa::{Direction, ValueOr};
 use rubato::{FastFixedIn, PolynomialDegree, Resampler};
 use symphonia::core::audio::GenericAudioBufferRef;
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
@@ -28,10 +26,12 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::{MetadataOptions, StandardTag};
 use symphonia::core::units::Time;
 
-use crate::audio_engine::{announce, claim_device_from_pipewire, release_device_to_pipewire, write_all, EngineCommand, NextHint, PlaybackStatus};
+use crate::audio_backend::{open_backend, probe_device, AudioBackend, OpenInfo, OpenReq, ProbeResult, WriteErr};
+use crate::audio_engine::{announce, EngineCommand, NextHint, PlaybackStatus};
 use crate::diagnostics;
 use crate::logger::log_msg;
-use crate::pcm_format::{can_reuse, pack_s24_3, pick_format, to_s24_low, OutFmt};
+use crate::pcm_format::{pack_s24_3, to_s24_low, OutFmt};
+use crate::ring_buffer::SpscRing;
 
 /// How long the sound card may sit idle (nothing queued, nothing playing) before it is handed back to PipeWire.
 const IDLE_CLOSE: Duration = Duration::from_millis(1500);
@@ -40,34 +40,8 @@ const IDLE_CLOSE: Duration = Duration::from_millis(1500);
 // Messages and the queue between the two threads
 // ---------------------------------------------------------------------------------------------
 
-/// What the decoder needs the card to look like for the next track.
-pub struct OpenReq {
-    pub device_id: String,
-    pub sample_rate: u32,
-    pub channels: u32,
-    pub bits: u32,
-}
-
-/// What the card actually is, once opened.
-#[derive(Clone, Debug)]
-pub struct OpenInfo {
-    pub device_id: String,
-    pub hw_rate: u32,
-    pub channels: u32,
-    pub wide: bool, // opened for a source of 24 bits or more
-    pub out_fmt: OutFmt,
-    pub lossless: bool, // output format is at least as wide as the source
-    pub fmt: String,
-    pub buffer: u64,
-    pub period: u64,
-}
-
-impl OpenInfo {
-    /// Can the open card carry a track with these parameters untouched?
-    pub fn fits(&self, r: &OpenReq) -> bool {
-        can_reuse((self.device_id.as_str(), self.hw_rate, self.channels, self.wide), (r.device_id.as_str(), r.sample_rate, r.channels, r.bits >= 24))
-    }
-}
+/// Capacity of the lock-free SPSC sample ring buffer (power of two, ~2.7s stereo @ 96 kHz).
+const SAMPLE_RING_CAP: usize = 524_288;
 
 /// Everything the UI shows about a track; applied to the status when the track becomes audible.
 #[derive(Clone)]
@@ -87,6 +61,8 @@ pub struct TrackMeta {
     pub buffer: u64,
     pub period: u64,
     pub bit_perfect: bool,
+    pub signal_mode: String,
+    pub cue_start_seconds: f64,
 }
 
 fn apply_meta(st: &mut PlaybackStatus, m: &TrackMeta, bump_serial: bool) {
@@ -109,6 +85,7 @@ fn apply_meta(st: &mut PlaybackStatus, m: &TrackMeta, bump_serial: bool) {
     st.active_buffer_frames = m.buffer;
     st.active_period_frames = m.period;
     st.is_bit_perfect = m.bit_perfect;
+    st.signal_mode = m.signal_mode.clone();
 }
 
 pub enum Samples {
@@ -122,7 +99,10 @@ pub enum Msg {
     /// A track starts here. `bump` is false when the same track continues (after a seek).
     Track(TrackMeta, bool),
     /// Device-rate frames. `src_start` is the source-file frame index of the first one.
+    #[allow(dead_code)]
     Data { samples: Samples, frames: usize, src_start: u64 },
+    /// Device-rate frames whose raw samples live in `Pipe::sample_ring` (zero-alloc path).
+    RingData { sample_count: usize, frames: usize, is_i16: bool, src_start: u64 },
     /// End of the whole queue: play what is left, then finish.
     End,
     /// Throw away what is buffered in the card (seek, skip); the card stays open.
@@ -132,8 +112,13 @@ pub enum Msg {
 }
 
 impl Msg {
-    fn is_data(&self) -> bool { matches!(self, Msg::Data { .. }) }
-    fn frames(&self) -> usize { if let Msg::Data { frames, .. } = self { *frames } else { 0 } }
+    fn is_data(&self) -> bool { matches!(self, Msg::Data { .. } | Msg::RingData { .. }) }
+    fn frames(&self) -> usize {
+        match self {
+            Msg::Data { frames, .. } | Msg::RingData { frames, .. } => *frames,
+            _ => 0,
+        }
+    }
     /// Messages that must get through even while paused.
     fn is_control(&self) -> bool { matches!(self, Msg::Flush | Msg::Stop) }
 }
@@ -154,6 +139,8 @@ struct PipeState {
 pub struct Pipe {
     st: Mutex<PipeState>,
     cv: Condvar,
+    /// Lock-free SPSC ring buffer carrying raw PCM samples from decoder to writer.
+    pub sample_ring: Arc<SpscRing<i32>>,
     /// Set by the decoder on Pause/Resume; the writer pauses the card between chunks.
     pub paused: AtomicBool,
     /// Set by the writer when the card failed; the decoder abandons the chain.
@@ -167,6 +154,7 @@ impl Pipe {
         Arc::new(Pipe {
             st: Mutex::new(PipeState { q: VecDeque::new(), frames: 0, open: None }),
             cv: Condvar::new(),
+            sample_ring: Arc::new(SpscRing::new(SAMPLE_RING_CAP)),
             paused: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             boundary_pending: AtomicBool::new(false),
@@ -248,95 +236,67 @@ impl Pipe {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The sound card: opening it, writing to it
+// Writing samples through the AudioBackend trait
 // ---------------------------------------------------------------------------------------------
 
-/// Open `hw:`-style devices directly and negotiate the widest-enough format, rate and buffer.
-fn open_pcm(req: &OpenReq) -> Result<(PCM, OpenInfo), ()> {
-    claim_device_from_pipewire(&req.device_id);
-
-    // EBUSY can linger briefly after the previous owner lets go, so retry. Never fall back to another
-    // device: "default" may be a microphone or the resampling mixer.
-    let mut opened = None;
-    for attempt in 0..10 {
-        match PCM::new(&req.device_id, Direction::Playback, false) {
-            Ok(p) => { diagnostics::REOPENED.fetch_add(1, Relaxed); opened = Some(p); break; }
-            Err(err) if err.errno() == 16 && attempt < 9 => thread::sleep(Duration::from_millis(100)),
-            Err(err) => {
-                log_msg("ERROR", format!("Failed to open '{}': {:?}. (EBUSY = another process, e.g. WirePlumber/PipeWire, holds the card)", req.device_id, err));
-                break;
-            }
-        }
+/// Write interleaved samples using pre-allocated scratch buffers (zero heap allocation in steady state).
+fn write_samples_zero_alloc(
+    backend: &mut dyn AudioBackend,
+    i32_samples: &[i32],
+    frames: usize,
+    is_i16: bool,
+    scratch_i16: &mut Vec<i16>,
+    scratch_i32: &mut Vec<i32>,
+    scratch_bytes: &mut Vec<u8>,
+) -> Result<(), WriteErr> {
+    let info = backend.info().clone();
+    let ch = info.channels as usize;
+    if is_i16 {
+        scratch_i16.clear();
+        scratch_i16.extend(i32_samples.iter().map(|&s| s as i16));
+        return backend.write_i16(scratch_i16, frames);
     }
-    let Some(pcm) = opened else {
-        log_msg("ERROR", "Playback aborted: no fallback device used.");
-        return Err(());
-    };
-    log_msg("ALSA", format!("✓ Successfully claimed PCM: '{}'", req.device_id));
-
-    let (out_fmt, lossless, hw_rate, buffer, period) = {
-        let hwp = HwParams::any(&pcm).map_err(|e| log_msg("ERROR", format!("No hardware parameters: {e:?}")))?;
-        let _ = hwp.set_access(Access::RWInterleaved);
-        let _ = hwp.set_rate_resample(false); // never let ALSA resample behind our back
-        let (fmt, lossless) = pick_format(req.bits, |f| hwp.test_format(f.alsa()).is_ok());
-        let _ = hwp.set_format(fmt.alsa());
-        let _ = hwp.set_channels(req.channels);
-        let _ = hwp.set_rate_near(req.sample_rate, ValueOr::Nearest);
-        // Bounded buffer (settings, default 500 ms / 100 ms): the device default is its maximum (~2 s),
-        // which is hard on USB audio and makes seeks lag.
-        let cfg = crate::settings::get();
-        let _ = hwp.set_buffer_time_near(cfg.buffer_ms * 1000, ValueOr::Nearest);
-        let _ = hwp.set_period_time_near(cfg.period_ms * 1000, ValueOr::Nearest);
-        pcm.hw_params(&hwp).map_err(|e| log_msg("ERROR", format!("Failed to apply HwParams: {e:?}")))?;
-        let cur = pcm.hw_params_current().map_err(|_| ())?;
-        (fmt, lossless, cur.get_rate().unwrap_or(req.sample_rate),
-         cur.get_buffer_size().unwrap_or(0).max(0) as u64, cur.get_period_size().unwrap_or(0).max(0) as u64)
-    };
-    let fmt = out_fmt.label(req.bits, lossless);
-    log_msg("ALSA", format!("HwParams applied: {hw_rate} Hz · {fmt}"));
-    set_start_threshold(&pcm);
-
-    let info = OpenInfo { device_id: req.device_id.clone(), hw_rate, channels: req.channels, wide: req.bits >= 24, out_fmt, lossless, fmt, buffer, period };
-    Ok((pcm, info))
-}
-
-/// Start playing only once the buffer is full, so the stream never starts half-fed.
-fn set_start_threshold(pcm: &PCM) {
-    if let (Ok(swp), Ok(hw)) = (pcm.sw_params_current(), pcm.hw_params_current()) {
-        if let Ok(buf) = hw.get_buffer_size() {
-            let _ = swp.set_start_threshold(buf);
-            let _ = pcm.sw_params(&swp);
+    match info.out_fmt {
+        OutFmt::S32 => backend.write_i32(i32_samples, frames),
+        OutFmt::S24Low => {
+            scratch_i32.clear();
+            to_s24_low(i32_samples, scratch_i32);
+            backend.write_i32(scratch_i32, frames)
         }
+        OutFmt::S243 => {
+            scratch_bytes.clear();
+            pack_s24_3(i32_samples, scratch_bytes);
+            backend.write_bytes(scratch_bytes, frames, ch * 3)
+        }
+        OutFmt::S16 => Err(WriteErr::Fatal),
     }
 }
 
-/// Write interleaved samples in whatever layout the card was opened with.
-fn write_samples(pcm: &PCM, info: &OpenInfo, samples: &Samples, frames: usize) -> Result<(), ()> {
+/// Write interleaved samples in whatever layout the card was opened with (legacy Vec path).
+fn write_samples(
+    backend: &mut dyn AudioBackend,
+    samples: &Samples,
+    frames: usize,
+    scratch_i32: &mut Vec<i32>,
+    scratch_bytes: &mut Vec<u8>,
+) -> Result<(), WriteErr> {
+    let info = backend.info().clone();
     let ch = info.channels as usize;
     match samples {
-        Samples::I16(v) => match pcm.io_i16() {
-            Ok(io) => write_all(pcm, &io, v, frames, ch),
-            Err(e) => { log_msg("ERROR", format!("Output format mismatch: {e}")); Err(()) }
-        },
+        Samples::I16(v) => backend.write_i16(v, frames),
         Samples::I32(v) => match info.out_fmt {
-            OutFmt::S32 => match pcm.io_i32() {
-                Ok(io) => write_all(pcm, &io, v, frames, ch),
-                Err(e) => { log_msg("ERROR", format!("Output format mismatch: {e}")); Err(()) }
-            },
+            OutFmt::S32 => backend.write_i32(v, frames),
             OutFmt::S24Low => {
-                let mut low = Vec::new();
-                to_s24_low(v, &mut low);
-                match pcm.io_i32_s24() {
-                    Ok(io) => write_all(pcm, &io, &low, frames, ch),
-                    Err(e) => { log_msg("ERROR", format!("Output format mismatch: {e}")); Err(()) }
-                }
+                scratch_i32.clear();
+                to_s24_low(v, scratch_i32);
+                backend.write_i32(scratch_i32, frames)
             }
             OutFmt::S243 => {
-                let mut bytes = Vec::new();
-                pack_s24_3(v, &mut bytes);
-                write_all(pcm, &pcm.io_bytes(), &bytes, frames, ch * 3)
+                scratch_bytes.clear();
+                pack_s24_3(v, scratch_bytes);
+                backend.write_bytes(scratch_bytes, frames, ch * 3)
             }
-            OutFmt::S16 => Err(()),
+            OutFmt::S16 => Err(WriteErr::Fatal),
         },
     }
 }
@@ -379,18 +339,42 @@ struct Entry {
 struct Writer {
     pipe: Arc<Pipe>,
     status: Arc<Mutex<PlaybackStatus>>,
-    pcm: Option<(PCM, OpenInfo)>,
+    backend: Option<Box<dyn AudioBackend>>,
     pcm_paused: bool,
     written: u64, // device frames written since the card was opened
     active: Option<Entry>, // the track you can hear
     pending: VecDeque<Entry>, // tracks queued behind it
     new_seg: bool, // the next audio chunk starts a track segment
     idle: Instant,
+    last_req: Option<OpenReq>,
+    reconnect_req: Option<OpenReq>,
+    last_reconnect_try: Instant,
+    scratch_ring: Vec<i32>,
+    scratch_i16: Vec<i16>,
+    scratch_i32: Vec<i32>,
+    scratch_bytes: Vec<u8>,
 }
 
 impl Writer {
     fn new(pipe: Arc<Pipe>, status: Arc<Mutex<PlaybackStatus>>) -> Self {
-        Writer { pipe, status, pcm: None, pcm_paused: false, written: 0, active: None, pending: VecDeque::new(), new_seg: false, idle: Instant::now() }
+        Writer {
+            pipe,
+            status,
+            backend: None,
+            pcm_paused: false,
+            written: 0,
+            active: None,
+            pending: VecDeque::new(),
+            new_seg: false,
+            idle: Instant::now(),
+            last_req: None,
+            reconnect_req: None,
+            last_reconnect_try: Instant::now(),
+            scratch_ring: Vec::with_capacity(8192),
+            scratch_i16: Vec::with_capacity(8192),
+            scratch_i32: Vec::with_capacity(8192),
+            scratch_bytes: Vec::with_capacity(8192 * 3),
+        }
     }
 
     fn with_status<R>(&self, f: impl FnOnce(&mut PlaybackStatus) -> R) -> R {
@@ -398,8 +382,12 @@ impl Writer {
     }
 
     fn run(&mut self) {
+        crate::rt_priority::promote_audio_thread();
         loop {
             self.sync_pause();
+            if self.reconnect_req.is_some() && self.last_reconnect_try.elapsed() >= Duration::from_secs(1) {
+                self.try_reconnect();
+            }
             match self.pipe.pop(Duration::from_millis(20)) {
                 Some(m) => { self.idle = Instant::now(); self.handle(m); }
                 None => self.maybe_idle_close(),
@@ -409,9 +397,9 @@ impl Writer {
 
     fn sync_pause(&mut self) {
         let want = self.pipe.paused.load(Relaxed);
-        if let Some((pcm, _)) = &self.pcm {
+        if let Some(backend) = &mut self.backend {
             if want != self.pcm_paused {
-                let _ = pcm.pause(want);
+                backend.pause(want);
                 self.pcm_paused = want;
             }
         } else {
@@ -421,7 +409,7 @@ impl Writer {
 
     /// Device frames still to be played.
     fn queued(&self) -> u64 {
-        self.pcm.as_ref().map_or(0, |(p, _)| p.delay().unwrap_or(0).max(0) as u64)
+        self.backend.as_ref().map_or(0, |b| b.delay_frames())
     }
 
     fn handle(&mut self, m: Msg) {
@@ -429,6 +417,7 @@ impl Writer {
             Msg::Open { req, reply } => self.open(req, reply),
             Msg::Track(meta, bump) => self.track(meta, bump),
             Msg::Data { samples, frames, src_start } => self.data(samples, frames, src_start),
+            Msg::RingData { sample_count, frames, is_i16, src_start } => self.ring_data(sample_count, frames, is_i16, src_start),
             Msg::End => self.end(),
             Msg::Flush => self.flush(),
             Msg::Stop => self.stop(),
@@ -436,22 +425,27 @@ impl Writer {
     }
 
     fn open(&mut self, req: OpenReq, reply: Option<Sender<Result<OpenInfo, ()>>>) {
-        if let Some((_, info)) = &self.pcm {
+        self.reconnect_req = None;
+        self.with_status(|st| st.device_disconnected = false);
+        self.last_req = Some(req.clone());
+        if let Some(backend) = &self.backend {
+            let info = backend.info();
             if info.fits(&req) {
                 if let Some(r) = reply { let _ = r.send(Ok(info.clone())); }
                 return;
             }
         }
         // different rate, width or device: let what is playing finish, then reopen
-        if self.pcm.is_some() {
+        if self.backend.is_some() {
             self.unpause();
-            if let Some((pcm, _)) = &self.pcm { let _ = pcm.drain(); }
+            if let Some(backend) = &mut self.backend { backend.drain(); }
             self.close_pcm();
         }
-        match open_pcm(&req) {
-            Ok((pcm, info)) => {
+        match open_backend(&req) {
+            Ok(backend) => {
+                let info = backend.info().clone();
                 self.pipe.set_open(Some(info.clone()));
-                self.pcm = Some((pcm, info.clone()));
+                self.backend = Some(backend);
                 if let Some(r) = reply { let _ = r.send(Ok(info)); }
             }
             Err(()) => {
@@ -480,8 +474,25 @@ impl Writer {
         if self.pending.is_empty() { self.pipe.boundary_pending.store(false, Relaxed); }
     }
 
-    fn data(&mut self, samples: Samples, frames: usize, src_start: u64) {
-        let Some((pcm, info)) = &self.pcm else { return }; // card failed or closed: drop stale audio
+    fn ring_data(&mut self, sample_count: usize, frames: usize, is_i16: bool, src_start: u64) {
+        if self.scratch_ring.len() < sample_count {
+            self.scratch_ring.resize(sample_count, 0);
+        }
+        let mut read = 0;
+        while read < sample_count {
+            let n = self.pipe.sample_ring.pop_slice(&mut self.scratch_ring[read..sample_count]);
+            if n == 0 {
+                // Should never happen because producer pushes before queueing RingData,
+                // unless a flush/reset raced; bail cleanly.
+                break;
+            }
+            read += n;
+        }
+        if read < sample_count {
+            return;
+        }
+        let Some(backend) = &mut self.backend else { return };
+        let info = backend.info().clone();
         let newest = self.pending.back_mut().or(self.active.as_mut());
         if self.new_seg {
             if let Some(e) = newest {
@@ -490,9 +501,44 @@ impl Writer {
             }
             self.new_seg = false;
         }
-        if write_samples(pcm, info, &samples, frames).is_err() {
-            self.fail();
-            return;
+        match write_samples_zero_alloc(
+            backend.as_mut(),
+            &self.scratch_ring[..sample_count],
+            frames,
+            is_i16,
+            &mut self.scratch_i16,
+            &mut self.scratch_i32,
+            &mut self.scratch_bytes,
+        ) {
+            Ok(()) => {}
+            Err(WriteErr::Disconnected) => { self.handle_disconnect(); return; }
+            Err(WriteErr::Fatal) => { self.fail(); return; }
+        }
+        self.written += frames as u64;
+        let (l, r) = if is_i16 {
+            peaks_i16(&self.scratch_i16[..sample_count], info.channels as usize)
+        } else {
+            peaks_i32(&self.scratch_ring[..sample_count], info.channels as usize)
+        };
+        self.with_status(|st| { st.vu_left = st.vu_left.max(l); st.vu_right = st.vu_right.max(r); });
+        self.update_clock();
+    }
+
+    fn data(&mut self, samples: Samples, frames: usize, src_start: u64) {
+        let Some(backend) = &mut self.backend else { return }; // card failed or closed: drop stale audio
+        let info = backend.info().clone();
+        let newest = self.pending.back_mut().or(self.active.as_mut());
+        if self.new_seg {
+            if let Some(e) = newest {
+                let ratio = e.meta.sample_rate as f64 / info.hw_rate.max(1) as f64;
+                e.seg = Some(Seg { mark: self.written, src0: src_start, ratio });
+            }
+            self.new_seg = false;
+        }
+        match write_samples(backend.as_mut(), &samples, frames, &mut self.scratch_i32, &mut self.scratch_bytes) {
+            Ok(()) => {}
+            Err(WriteErr::Disconnected) => { self.handle_disconnect(); return; }
+            Err(WriteErr::Fatal) => { self.fail(); return; }
         }
         self.written += frames as u64;
         let (l, r) = match &samples {
@@ -513,17 +559,19 @@ impl Writer {
         if let Some(a) = &self.active {
             if let Some(seg) = &a.seg {
                 let src = seg.src0 as f64 + audible.saturating_sub(seg.mark) as f64 * seg.ratio;
-                let pos = src / a.meta.sample_rate.max(1) as f64;
+                let abs_pos = src / a.meta.sample_rate.max(1) as f64;
+                let pos = (abs_pos - a.meta.cue_start_seconds).max(0.0);
                 self.with_status(|st| st.position_seconds = pos);
             }
         }
     }
 
     fn flush(&mut self) {
-        if let Some((pcm, _)) = &self.pcm {
-            let _ = pcm.drop();
-            let _ = pcm.prepare();
-            set_start_threshold(pcm);
+        self.pipe.sample_ring.consumer_discard_all();
+        self.reconnect_req = None;
+        self.with_status(|st| st.device_disconnected = false);
+        if let Some(backend) = &mut self.backend {
+            backend.flush_and_prepare();
         }
         self.active = None;
         self.pending.clear();
@@ -533,7 +581,7 @@ impl Writer {
 
     fn end(&mut self) {
         self.unpause();
-        if let Some((pcm, _)) = &self.pcm { let _ = pcm.drain(); }
+        if let Some(backend) = &mut self.backend { backend.drain(); }
         self.active = None;
         self.pending.clear();
         self.pipe.boundary_pending.store(false, Relaxed);
@@ -550,6 +598,8 @@ impl Writer {
     }
 
     fn stop(&mut self) {
+        self.pipe.sample_ring.consumer_discard_all();
+        self.reconnect_req = None;
         self.unpause();
         self.close_pcm();
         self.pipe.set_open(None);
@@ -557,7 +607,41 @@ impl Writer {
         announce();
     }
 
+    fn handle_disconnect(&mut self) {
+        self.close_pcm();
+        self.pipe.set_open(None);
+        self.pipe.paused.store(true, Relaxed);
+        self.reconnect_req = self.last_req.clone();
+        self.last_reconnect_try = Instant::now();
+        self.with_status(|st| {
+            st.device_disconnected = true;
+            st.is_paused = true;
+            st.vu_left = 0.0;
+            st.vu_right = 0.0;
+        });
+        log_msg("WARN", "USB DAC disconnected — paused and waiting for reconnection");
+        announce();
+    }
+
+    fn try_reconnect(&mut self) {
+        self.last_reconnect_try = Instant::now();
+        let Some(req) = self.reconnect_req.clone() else { return };
+        if matches!(probe_device(&req.device_id), ProbeResult::Missing) {
+            return; // still disconnected
+        }
+        if let Ok(backend) = open_backend(&req) {
+            self.pipe.set_open(Some(backend.info().clone()));
+            self.backend = Some(backend);
+            self.reconnect_req = None;
+            self.with_status(|st| st.device_disconnected = false);
+            log_msg("INFO", format!("USB DAC '{}' reconnected — ready to resume", req.device_id));
+            announce();
+        }
+    }
+
     fn fail(&mut self) {
+        self.pipe.sample_ring.consumer_discard_all();
+        self.reconnect_req = None;
         self.close_pcm();
         self.pipe.set_open(None);
         self.pipe.failed.store(true, Relaxed);
@@ -574,6 +658,7 @@ impl Writer {
         self.with_status(|st| {
             st.is_playing = false;
             st.is_paused = false;
+            st.device_disconnected = false;
             st.position_seconds = 0.0;
             st.vu_left = 0.0;
             st.vu_right = 0.0;
@@ -582,24 +667,23 @@ impl Writer {
 
     fn unpause(&mut self) {
         if self.pcm_paused {
-            if let Some((pcm, _)) = &self.pcm { let _ = pcm.pause(false); }
+            if let Some(backend) = &mut self.backend { backend.pause(false); }
             self.pcm_paused = false;
         }
     }
 
-    /// Drop the card and hand it back to PipeWire.
+    /// Drop the card and hand it back to PipeWire (on Linux).
     fn close_pcm(&mut self) {
-        if let Some((pcm, _)) = self.pcm.take() {
-            let _ = pcm.drop();
-            drop(pcm);
+        if let Some(mut backend) = self.backend.take() {
+            backend.close();
+            drop(backend);
         }
         self.pcm_paused = false;
         self.written = 0;
-        release_device_to_pipewire();
     }
 
     fn maybe_idle_close(&mut self) {
-        if self.pcm.is_none() || self.active.is_some() || self.idle.elapsed() < IDLE_CLOSE { return; }
+        if self.backend.is_none() || self.active.is_some() || self.idle.elapsed() < IDLE_CLOSE { return; }
         let mut g = self.pipe.lock();
         if !g.q.is_empty() { return; } // the decoder just queued something: stay open
         g.open = None; // decided under the same lock the decoder checks, so it cannot reuse a dying card
@@ -631,19 +715,30 @@ struct Ctx<'a> {
     rx: &'a Receiver<EngineCommand>,
     status: &'a Arc<Mutex<PlaybackStatus>>,
     pipe: &'a Arc<Pipe>,
+    vis: &'a Arc<crate::visualizer::VisQueue>,
+}
+
+enum Source {
+    Symphonia {
+        reader: Box<dyn FormatReader>,
+        decoder: Box<dyn AudioDecoder>,
+        track_id: u32,
+        resampler: Option<FastFixedIn<f32>>,
+        fifo: Vec<Vec<f32>>,
+    },
+    Dsd(crate::dsd::DsdReader),
 }
 
 struct Track {
-    reader: Box<dyn FormatReader>,
-    decoder: Box<dyn AudioDecoder>,
-    track_id: u32,
+    source: Source,
     meta: TrackMeta,
     info: OpenInfo,
-    sample_rate: u32,
+    sample_rate: u32, // device-side / DoP rate for DSD; source PCM rate for PCM
     channels: usize,
-    resampler: Option<FastFixedIn<f32>>,
-    fifo: Vec<Vec<f32>>,
     src_frame: u64, // source frames decoded so far
+    cue_start: f64,
+    cue_end_frame: Option<u64>,
+    analyzer: crate::visualizer::Analyzer,
 }
 
 /// Interleaved decoder output -> device-rate chunks (resampled when the card runs at another rate).
@@ -688,9 +783,98 @@ fn floats_to_samples(o: &[Vec<f32>], info: &OpenInfo, channels: usize) -> (Sampl
 }
 
 impl Track {
+    fn request_open(c: &Ctx, req: OpenReq) -> Result<OpenInfo, Outcome> {
+        match c.pipe.begin(req) {
+            Begin::Reuse(info) => {
+                diagnostics::REUSED.fetch_add(1, Relaxed);
+                log_msg("ALSA", format!("Gapless: reusing open PCM '{}' @ {} Hz", info.device_id, info.hw_rate));
+                Ok(info)
+            }
+            Begin::Wait(rx) => {
+                let started = Instant::now();
+                loop {
+                    match rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok(Ok(info)) => return Ok(info),
+                        Ok(Err(())) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(Outcome::Failed),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            while let Ok(cmd) = c.rx.try_recv() {
+                                match cmd {
+                                    EngineCommand::Stop => return Err(Outcome::Stopped),
+                                    EngineCommand::Play { file_path, device_id } => return Err(Outcome::Switch(file_path, device_id)),
+                                    _ => {}
+                                }
+                            }
+                            if started.elapsed() > Duration::from_secs(20) { return Err(Outcome::Failed); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Probe the file, ask the writer for a suitable card, announce the track.
     fn open(c: &Ctx, file_path: &str, device_id: &str) -> Result<Track, Outcome> {
-        let path = Path::new(file_path);
+        let (real_path_str, cue_span) = crate::cue::parse_virtual_path(file_path);
+        let path = Path::new(real_path_str);
+        let cue_start = cue_span.map(|(s, _)| s).unwrap_or(0.0);
+        let cue_end = cue_span.and_then(|(_, e)| e);
+
+        if crate::dsd::is_dsd_path(path) {
+            let mut dsd = crate::dsd::DsdReader::open(path).ok_or(Outcome::Unplayable)?;
+            let dsd_rate = dsd.info.dsd_rate;
+            let dop_rate = dsd.info.dop_rate;
+            let channels = dsd.info.channels;
+            let title = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Unknown Title").to_string();
+            let album = path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()).unwrap_or("DSD Audio").to_string();
+            let duration = cue_end.map(|e| (e - cue_start).max(0.0)).unwrap_or_else(|| (dsd.info.duration_seconds - cue_start).max(0.0));
+            let label = dsd.info.dsd_label.clone();
+
+            log_msg("INFO", format!("Playing {}: {} ({})", label, title, path.display()));
+            log_msg("INFO", format!("DSD Format: {dsd_rate} Hz (DoP {dop_rate} Hz · 24-bit) · {channels} channels · Duration: {duration:.2}s"));
+            log_msg("ALSA", format!("Requesting DoP output endpoint: '{device_id}'"));
+
+            let req = OpenReq { device_id: device_id.to_string(), sample_rate: dop_rate, channels, bits: 24 };
+            let info = Self::request_open(c, req)?;
+
+            // DoP MUST NEVER be resampled or truncated, otherwise markers are destroyed into white noise.
+            if info.hw_rate != dop_rate || !info.lossless {
+                log_msg("ERROR", format!("DAC '{}' opened at {} Hz ({}), cannot carry {} DoP @ {} Hz untouched", device_id, info.hw_rate, info.fmt, label, dop_rate));
+                return Err(Outcome::Unplayable);
+            }
+            let signal_mode = format!("DoP ({label})");
+            log_msg("INFO", format!(">>> ⚡ {signal_mode} VERIFIED: Direct HW '{device_id}' @ {dop_rate} Hz"));
+
+            if cue_start > 0.0 {
+                dsd.seek_seconds(cue_start);
+            }
+            let src_frame = (cue_start * dop_rate as f64) as u64;
+            let cue_end_frame = cue_end.map(|e| (e * dop_rate as f64) as u64);
+
+            let meta = TrackMeta {
+                file_path: file_path.to_string(), title, artist: "DSD Audio".into(), album,
+                sample_rate: dop_rate, bit_depth: 24, channels,
+                duration_seconds: duration, replay_gain_db: 0.0, device_id: device_id.to_string(),
+                hw_rate: info.hw_rate, hw_format: info.fmt.clone(), buffer: info.buffer, period: info.period,
+                bit_perfect: true, signal_mode, cue_start_seconds: cue_start,
+            };
+            {
+                let mut st = c.status.lock().unwrap_or_else(|e| e.into_inner());
+                st.decoding_path = Some(file_path.to_string());
+                st.decoder_serial += 1;
+            }
+            announce();
+
+            let mut t = Track {
+                source: Source::Dsd(dsd), meta: meta.clone(), info, sample_rate: dop_rate,
+                channels: channels as usize, src_frame, cue_start, cue_end_frame,
+                analyzer: crate::visualizer::Analyzer::new(dop_rate),
+            };
+            return match t.send(c, Msg::Track(meta, true)) {
+                Poll::Go | Poll::Dropped => Ok(t),
+                Poll::Out(o) => Err(o),
+            };
+        }
+
         let src = File::open(path).map_err(|_| Outcome::Unplayable)?;
         let mss = MediaSourceStream::new(Box::new(src), Default::default());
         let mut hint = Hint::new();
@@ -705,7 +889,10 @@ impl Track {
         let sample_rate = audio.sample_rate.unwrap_or(44100);
         let channels = audio.channels.as_ref().map(|c| c.count() as u32).unwrap_or(2);
         let bits = audio.bits_per_sample.unwrap_or(16);
-        let duration = track.num_frames.map(|f| f as f64 / sample_rate as f64).unwrap_or(0.0);
+        let total_duration = track.num_frames.map(|f| f as f64 / sample_rate as f64).unwrap_or(0.0);
+        let duration = cue_end
+            .map(|e| (e - cue_start).max(0.0))
+            .unwrap_or_else(|| (total_duration - cue_start).max(0.0));
 
         let mut title = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Unknown Title").to_string();
         let (mut artist, mut album, mut gain) = ("Unknown Artist".to_string(), "Local Audio".to_string(), 0.0f32);
@@ -726,36 +913,23 @@ impl Track {
 
         // Ask the writer for a card. If the open one fits it carries on without a gap.
         let req = OpenReq { device_id: device_id.to_string(), sample_rate, channels, bits };
-        let info = match c.pipe.begin(req) {
-            Begin::Reuse(info) => {
-                diagnostics::REUSED.fetch_add(1, Relaxed);
-                log_msg("ALSA", format!("Gapless: reusing open PCM '{}' @ {} Hz", device_id, info.hw_rate));
-                info
-            }
-            Begin::Wait(rx) => {
-                let started = Instant::now();
-                loop {
-                    match rx.recv_timeout(Duration::from_millis(100)) {
-                        Ok(Ok(info)) => break info,
-                        Ok(Err(())) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(Outcome::Failed),
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            // the card may still be draining the previous track; stay responsive to Stop / another Play
-                            while let Ok(cmd) = c.rx.try_recv() {
-                                match cmd {
-                                    EngineCommand::Stop => return Err(Outcome::Stopped),
-                                    EngineCommand::Play { file_path, device_id } => return Err(Outcome::Switch(file_path, device_id)),
-                                    _ => {}
-                                }
-                            }
-                            if started.elapsed() > Duration::from_secs(20) { return Err(Outcome::Failed); }
-                        }
-                    }
-                }
-            }
-        };
+        let info = Self::request_open(c, req)?;
 
         let is_hw = device_id.starts_with("hw:") || device_id.starts_with("plughw:");
         let bit_perfect = is_hw && info.hw_rate == sample_rate && info.lossless;
+        let bp_lock = crate::settings::get().bit_perfect_lock;
+        let signal_mode = if bit_perfect && bp_lock {
+            "Bit-Perfect + 0 dBFS Lock".to_string()
+        } else if bit_perfect {
+            "Bit-Perfect Direct".to_string()
+        } else if info.hw_rate != sample_rate {
+            "Software Resampled".to_string()
+        } else if !is_hw {
+            "Shared Mixer".to_string()
+        } else {
+            "Bit-Depth Truncated".to_string()
+        };
+
         if !info.lossless {
             log_msg("WARN", format!("Output format {} is narrower than the {bits}-bit source: not bit-perfect", info.fmt));
         }
@@ -765,7 +939,7 @@ impl Track {
             log_msg("INFO", format!(">>> 🎛️ IN-ENGINE RESAMPLER: Converting {} Hz -> {} Hz on '{}' (1.0x pitch preserved)", sample_rate, info.hw_rate, device_id));
         } else if !is_hw {
             log_msg("INFO", format!(">>> Shared device '{}' @ {} Hz: the system mixer may process the audio", device_id, info.hw_rate));
-        } // else: the narrower-format warning above already explains why it is not bit-perfect
+        }
 
         let decoder = symphonia::default::get_codecs()
             .make_audio_decoder(audio, &AudioDecoderOptions::default())
@@ -776,10 +950,18 @@ impl Track {
             None
         };
 
+        if cue_start > 0.0 {
+            let time = Time::try_from_secs_f64(cue_start).unwrap_or(Time::ZERO);
+            let _ = reader.seek(SeekMode::Accurate, SeekTo::Time { time, track_id: Some(track.id) });
+        }
+        let src_frame = (cue_start * sample_rate as f64) as u64;
+        let cue_end_frame = cue_end.map(|e| (e * sample_rate as f64) as u64);
+
         let meta = TrackMeta {
             file_path: file_path.to_string(), title, artist, album, sample_rate, bit_depth: bits, channels,
             duration_seconds: duration, replay_gain_db: gain, device_id: device_id.to_string(), hw_rate: info.hw_rate,
-            hw_format: info.fmt.clone(), buffer: info.buffer, period: info.period, bit_perfect,
+            hw_format: info.fmt.clone(), buffer: info.buffer, period: info.period, bit_perfect, signal_mode,
+            cue_start_seconds: cue_start,
         };
         // tell the UI what the decoder is on, so it can name the track after this one in good time
         {
@@ -789,9 +971,13 @@ impl Track {
         }
         announce();
 
+        let hw_rate = info.hw_rate;
         let mut t = Track {
-            reader, decoder, track_id: track.id, meta: meta.clone(), info, sample_rate, channels: channels as usize,
-            resampler, fifo: vec![Vec::new(); channels as usize], src_frame: 0,
+            source: Source::Symphonia {
+                reader, decoder, track_id: track.id, resampler, fifo: vec![Vec::new(); channels as usize],
+            },
+            meta: meta.clone(), info, sample_rate, channels: channels as usize, src_frame, cue_start, cue_end_frame,
+            analyzer: crate::visualizer::Analyzer::new(hw_rate),
         };
         match t.send(c, Msg::Track(meta, true)) {
             Poll::Go | Poll::Dropped => Ok(t),
@@ -814,7 +1000,12 @@ impl Track {
                 EngineCommand::Pause => {
                     if let Some(o) = self.pause(c) { return Poll::Out(o); }
                 }
-                EngineCommand::Resume => {}
+                EngineCommand::Resume => {
+                    if c.pipe.paused.swap(false, Relaxed) {
+                        c.status.lock().unwrap_or_else(|e| e.into_inner()).is_paused = false;
+                        announce();
+                    }
+                }
             }
         }
         Poll::Go
@@ -845,15 +1036,24 @@ impl Track {
     }
 
     fn seek(&mut self, c: &Ctx, pos: f64) {
-        let time = Time::try_from_secs_f64(pos).unwrap_or(Time::ZERO);
-        let _ = self.reader.seek(SeekMode::Accurate, SeekTo::Time { time, track_id: Some(self.track_id) });
-        self.src_frame = (pos * self.sample_rate as f64) as u64;
-        self.decoder.reset();
-        if let Some(rs) = self.resampler.as_mut() {
-            rs.reset();
-            for ch in self.fifo.iter_mut() { ch.clear(); }
+        let abs_pos = self.cue_start + pos.max(0.0);
+        match &mut self.source {
+            Source::Symphonia { reader, decoder, track_id, resampler, fifo } => {
+                let time = Time::try_from_secs_f64(abs_pos).unwrap_or(Time::ZERO);
+                let _ = reader.seek(SeekMode::Accurate, SeekTo::Time { time, track_id: Some(*track_id) });
+                decoder.reset();
+                if let Some(rs) = resampler.as_mut() {
+                    rs.reset();
+                    for ch in fifo.iter_mut() { ch.clear(); }
+                }
+            }
+            Source::Dsd(dsd) => {
+                dsd.seek_seconds(abs_pos);
+            }
         }
+        self.src_frame = (abs_pos * self.sample_rate as f64) as u64;
         // drop what is queued and buffered in the card, then carry on with this same track
+        c.vis.clear();
         c.pipe.flush(vec![Msg::Track(self.meta.clone(), false)]);
         c.status.lock().unwrap_or_else(|e| e.into_inner()).position_seconds = pos;
     }
@@ -875,9 +1075,65 @@ impl Track {
         }
     }
 
+    fn emit_ring_i32(&mut self, c: &Ctx, slice: &[i32], frames: usize, is_i16: bool, src_start: u64) -> Poll {
+        let mut off = 0;
+        while off < slice.len() {
+            if c.pipe.failed.load(Relaxed) { return Poll::Out(Outcome::Failed); }
+            let n = c.pipe.sample_ring.push_slice(&slice[off..]);
+            if n > 0 {
+                off += n;
+            } else {
+                match self.poll(c) {
+                    Poll::Go => thread::sleep(Duration::from_millis(5)),
+                    other => return other,
+                }
+            }
+        }
+        self.send(c, Msg::RingData { sample_count: slice.len(), frames, is_i16, src_start })
+    }
+
     fn emit(&mut self, c: &Ctx, chunks: Vec<(Samples, usize)>, src_start: u64) -> Poll {
+        let mut i16_buf = [0i32; 1024];
+        let pos_secs = (src_start as f64 / self.sample_rate.max(1) as f64 - self.cue_start).max(0.0);
         for (samples, frames) in chunks {
-            match self.send(c, Msg::Data { samples, frames, src_start }) {
+            let res = match &samples {
+                Samples::I32(v) => {
+                    self.analyzer.feed_i32(v, self.channels, pos_secs, c.vis);
+                    self.emit_ring_i32(c, v, frames, false, src_start)
+                }
+                Samples::I16(v) => {
+                    self.analyzer.feed_i16(v, self.channels, pos_secs, c.vis);
+                    let mut off = 0;
+                    let mut poll_res = Poll::Go;
+                    while off < v.len() {
+                        if c.pipe.failed.load(Relaxed) { return Poll::Out(Outcome::Failed); }
+                        let n = (v.len() - off).min(i16_buf.len());
+                        for (dst, &src) in i16_buf[..n].iter_mut().zip(&v[off..off + n]) {
+                            *dst = src as i32;
+                        }
+                        let mut pushed = 0;
+                        while pushed < n {
+                            let w = c.pipe.sample_ring.push_slice(&i16_buf[pushed..n]);
+                            if w > 0 {
+                                pushed += w;
+                            } else {
+                                match self.poll(c) {
+                                    Poll::Go => thread::sleep(Duration::from_millis(5)),
+                                    other => { poll_res = other; break; }
+                                }
+                            }
+                        }
+                        if !matches!(poll_res, Poll::Go) { break; }
+                        off += n;
+                    }
+                    if matches!(poll_res, Poll::Go) {
+                        self.send(c, Msg::RingData { sample_count: v.len(), frames, is_i16: true, src_start })
+                    } else {
+                        poll_res
+                    }
+                }
+            };
+            match res {
                 Poll::Go => {}
                 other => return other,
             }
@@ -891,42 +1147,63 @@ fn play_one(c: &Ctx, next_hint: &NextHint, file_path: &str, device_id: &str) -> 
         Ok(t) => t,
         Err(o) => return o,
     };
+    let mut dop_buf = Vec::new();
     loop {
         match t.poll(c) {
             Poll::Go | Poll::Dropped => {}
             Poll::Out(o) => return o,
         }
         if c.pipe.failed.load(Relaxed) { return Outcome::Failed; }
+        if let Some(end_frame) = t.cue_end_frame {
+            if t.src_frame >= end_frame {
+                break;
+            }
+        }
 
-        let packet = match t.reader.next_packet() {
-            Ok(Some(p)) => p,
-            Ok(None) | Err(SymphoniaError::IoError(_)) => break, // end of file (some demuxers report it as an I/O error)
-            Err(_) => return Outcome::Stopped,
-        };
-        if packet.track_id != t.track_id { continue; }
+        match &mut t.source {
+            Source::Dsd(dsd) => {
+                let t0 = Instant::now();
+                let Some(frames) = dsd.next_dop_chunk(&mut dop_buf) else { break };
+                diagnostics::note_decode(t0.elapsed());
+                let src_start = t.src_frame;
+                t.src_frame += frames as u64;
+                match t.emit_ring_i32(c, &dop_buf, frames, false, src_start) {
+                    Poll::Go | Poll::Dropped => {}
+                    Poll::Out(o) => return o,
+                }
+            }
+            Source::Symphonia { reader, decoder, track_id, resampler, fifo } => {
+                let packet = match reader.next_packet() {
+                    Ok(Some(p)) => p,
+                    Ok(None) | Err(SymphoniaError::IoError(_)) => break, // end of file (some demuxers report it as an I/O error)
+                    Err(_) => return Outcome::Stopped,
+                };
+                if packet.track_id != *track_id { continue; }
 
-        let t0 = Instant::now();
-        let decoded = t.decoder.decode(&packet);
-        diagnostics::note_decode(t0.elapsed());
-        let buf = match decoded {
-            Ok(b) => b,
-            Err(SymphoniaError::DecodeError(_)) => continue,
-            Err(_) => return Outcome::Stopped,
-        };
-        let src_start = t.src_frame;
-        let frames_in = buf.frames() as u64;
-        let chunks = convert(&buf, &t.info, &mut t.resampler, &mut t.fifo, t.channels);
-        t.src_frame += frames_in;
-        match t.emit(c, chunks, src_start) {
-            Poll::Go | Poll::Dropped => {}
-            Poll::Out(o) => return o,
+                let t0 = Instant::now();
+                let decoded = decoder.decode(&packet);
+                diagnostics::note_decode(t0.elapsed());
+                let buf = match decoded {
+                    Ok(b) => b,
+                    Err(SymphoniaError::DecodeError(_)) => continue,
+                    Err(_) => return Outcome::Stopped,
+                };
+                let src_start = t.src_frame;
+                let frames_in = buf.frames() as u64;
+                let chunks = convert(&buf, &t.info, resampler, fifo, t.channels);
+                t.src_frame += frames_in;
+                match t.emit(c, chunks, src_start) {
+                    Poll::Go | Poll::Dropped => {}
+                    Poll::Out(o) => return o,
+                }
+            }
         }
     }
 
     // end of file: push out what the resampler still holds
-    if let Some(rs) = t.resampler.as_mut() {
-        if !t.fifo[0].is_empty() {
-            if let Ok(o) = rs.process_partial(Some(&t.fifo), None) {
+    if let Source::Symphonia { resampler: Some(rs), fifo, .. } = &mut t.source {
+        if !fifo[0].is_empty() {
+            if let Ok(o) = rs.process_partial(Some(fifo), None) {
                 let chunk = floats_to_samples(&o, &t.info, t.channels);
                 let src_start = t.src_frame;
                 match t.emit(c, vec![chunk], src_start) {
@@ -947,6 +1224,7 @@ fn play_one(c: &Ctx, next_hint: &NextHint, file_path: &str, device_id: &str) -> 
 fn play_chain(c: &Ctx, next_hint: &NextHint, first: (String, String)) {
     c.pipe.failed.store(false, Relaxed);
     c.pipe.paused.store(false, Relaxed);
+    c.vis.clear();
     c.pipe.flush(vec![]); // a new Play starts clean: drop whatever the previous one left queued or buffered
     let mut target = Some(first);
     let mut first_track = true;
@@ -976,7 +1254,7 @@ fn play_chain(c: &Ctx, next_hint: &NextHint, first: (String, String)) {
 }
 
 /// Runs on the engine thread: spawns the writer, then serves commands as the decoder.
-pub fn run(rx: Receiver<EngineCommand>, status: Arc<Mutex<PlaybackStatus>>, next_hint: NextHint) {
+pub fn run(rx: Receiver<EngineCommand>, status: Arc<Mutex<PlaybackStatus>>, next_hint: NextHint, vis: Arc<crate::visualizer::VisQueue>) {
     let pipe = Pipe::new();
     {
         let (p, s) = (pipe.clone(), status.clone());
@@ -984,12 +1262,13 @@ pub fn run(rx: Receiver<EngineCommand>, status: Arc<Mutex<PlaybackStatus>>, next
             .spawn(move || Writer::new(p, s).run())
             .expect("failed to spawn the audio writer thread");
     }
-    let c = Ctx { rx: &rx, status: &status, pipe: &pipe };
+    let c = Ctx { rx: &rx, status: &status, pipe: &pipe, vis: &vis };
     while let Ok(cmd) = rx.recv() {
         match cmd {
             EngineCommand::Play { file_path, device_id } => play_chain(&c, &next_hint, (file_path, device_id)),
             EngineCommand::Stop => {
                 pipe.paused.store(false, Relaxed);
+                vis.clear();
                 pipe.flush(vec![Msg::Stop]);
             }
             _ => {}
@@ -1006,7 +1285,7 @@ mod tests {
     }
 
     fn kind(m: &Msg) -> &'static str {
-        match m { Msg::Open { .. } => "open", Msg::Track(..) => "track", Msg::Data { .. } => "data", Msg::End => "end", Msg::Flush => "flush", Msg::Stop => "stop" }
+        match m { Msg::Open { .. } => "open", Msg::Track(..) => "track", Msg::Data { .. } | Msg::RingData { .. } => "data", Msg::End => "end", Msg::Flush => "flush", Msg::Stop => "stop" }
     }
 
     #[test]
@@ -1077,7 +1356,8 @@ mod tests {
 
     fn dummy_meta() -> TrackMeta {
         TrackMeta { file_path: "x".into(), title: "t".into(), artist: "a".into(), album: "b".into(), sample_rate: 44100, bit_depth: 16, channels: 2,
-            duration_seconds: 1.0, replay_gain_db: 0.0, device_id: "hw:1,0".into(), hw_rate: 44100, hw_format: "S16".into(), buffer: 0, period: 0, bit_perfect: true }
+            duration_seconds: 1.0, replay_gain_db: 0.0, device_id: "hw:1,0".into(), hw_rate: 44100, hw_format: "S16".into(), buffer: 0, period: 0, bit_perfect: true,
+            signal_mode: "Bit-Perfect Direct".into(), cue_start_seconds: 0.0 }
     }
 
     #[test]

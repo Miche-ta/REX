@@ -1,4 +1,5 @@
-//! Sample-format negotiation and packing for the ALSA output. Pure functions, unit-tested.
+//! Sample-format negotiation and packing for audio hardware output. Pure functions, unit-tested.
+#[cfg(target_os = "linux")]
 use alsa::pcm::Format;
 
 /// How samples are laid out on the wire to the DAC.
@@ -11,6 +12,7 @@ pub enum OutFmt {
 }
 
 impl OutFmt {
+    #[cfg(target_os = "linux")]
     pub fn alsa(self) -> Format {
         match self {
             OutFmt::S16 => Format::s16(),

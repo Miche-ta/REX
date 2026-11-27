@@ -2965,7 +2965,10 @@ version = "0.1.0"
 dependencies = [
  "alsa",
  "base64 0.23.1",
+ "dirs",
+ "libc",
  "rubato",
+ "rustfft",
  "serde",
  "serde_json",
  "symphonia",
@@ -2973,6 +2976,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "ureq",
+ "windows",
  "zbus",
 ]
 

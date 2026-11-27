@@ -625,22 +625,141 @@ let targetVuR = 0;
 let currentLyrics = [];
 let currentLyricIdx = -1;
 
+let currentVisMode = "art";
+let visCaps = new Array(32).fill(0);
+let visSmooth = new Array(32).fill(0);
+
 function initVisualTabs() {
   const tabs = document.querySelectorAll("#vtabs button");
   const art = $("art-wrapper");
   const vu = $("vu-panel");
+  const spectrum = $("spectrum-panel");
+  const scope = $("scope-panel");
   const lyrics = $("lyrics-panel");
 
   function showVis(mode) {
+    currentVisMode = mode;
     tabs.forEach((b) => b.classList.toggle("on", b.dataset.vis === mode));
     art.hidden = mode !== "art";
     vu.hidden = mode !== "vu";
+    spectrum.hidden = mode !== "spectrum";
+    scope.hidden = mode !== "scope";
     lyrics.hidden = mode !== "lyrics";
     store.set("visualMode", mode);
   }
 
   tabs.forEach((b) => b.addEventListener("click", () => showVis(b.dataset.vis)));
   showVis(store.get("visualMode", "art"));
+  startVisLoop();
+}
+
+function drawSpectrum(frame) {
+  const canvas = $("spectrum-canvas");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width, h = canvas.height;
+  const cs = getComputedStyle(document.documentElement);
+  const accent = cs.getPropertyValue("--accent").trim() || "#4fd1c5";
+  const line = cs.getPropertyValue("--line").trim() || "rgba(255,255,255,0.08)";
+  const faint = cs.getPropertyValue("--text-faint").trim() || "#888";
+
+  ctx.clearRect(0, 0, w, h);
+  // Subtle dB grid lines
+  ctx.strokeStyle = line;
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    const y = Math.round((h * i) / 4) + 0.5;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+
+  const bands = frame.bands || [];
+  const n = bands.length || 32;
+  const padX = 10, padY = 12;
+  const plotW = w - padX * 2, plotH = h - padY * 2;
+  const step = plotW / n;
+  const barW = Math.max(2, step - 3);
+
+  for (let i = 0; i < n; i++) {
+    const target = bands[i] || 0;
+    visSmooth[i] += (target - visSmooth[i]) * (target > visSmooth[i] ? 0.5 : 0.2);
+    visCaps[i] = Math.max(visSmooth[i], visCaps[i] - 0.012);
+    const bh = visSmooth[i] * plotH;
+    const x = padX + i * step + 1;
+    const y = h - padY - bh;
+
+    ctx.fillStyle = accent;
+    ctx.fillRect(x, y, barW, bh);
+
+    const capY = h - padY - visCaps[i] * plotH;
+    ctx.fillStyle = faint;
+    ctx.fillRect(x, capY - 2, barW, 2);
+  }
+
+  const pL = frame.peak_l_db > -59.5 ? frame.peak_l_db.toFixed(1) : "-∞";
+  const pR = frame.peak_r_db > -59.5 ? frame.peak_r_db.toFixed(1) : "-∞";
+  $("spectrum-meta").textContent = `32-band FFT · Peak ${pL} / ${pR} dBFS`;
+}
+
+function drawScope(frame) {
+  const canvas = $("scope-canvas");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width, h = canvas.height;
+  const cs = getComputedStyle(document.documentElement);
+  const accent = cs.getPropertyValue("--accent").trim() || "#4fd1c5";
+  const line = cs.getPropertyValue("--line-strong").trim() || "rgba(255,255,255,0.12)";
+
+  // Phosphor trail decay
+  ctx.fillStyle = "rgba(0, 0, 0, 0.25)";
+  ctx.fillRect(0, 0, w, h);
+
+  const cx = w / 2, cy = h / 2;
+  const r = Math.min(w, h) * 0.42;
+
+  ctx.strokeStyle = line;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(cx - r, cy); ctx.lineTo(cx + r, cy);
+  ctx.moveTo(cx, cy - r); ctx.lineTo(cx, cy + r);
+  ctx.moveTo(cx - r * 0.707, cy - r * 0.707); ctx.lineTo(cx + r * 0.707, cy + r * 0.707);
+  ctx.moveTo(cx - r * 0.707, cy + r * 0.707); ctx.lineTo(cx + r * 0.707, cy - r * 0.707);
+  ctx.stroke();
+
+  const pts = frame.scope || [];
+  if (pts.length) {
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let i = 0; i < pts.length; i++) {
+      const [l, rv] = pts[i];
+      // Goniometer rotation: X = (L - R) / sqrt(2), Y = (L + R) / sqrt(2)
+      const x = cx + ((l - rv) * 0.707) * r;
+      const y = cy - ((l + rv) * 0.707) * r;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  const corr = (frame.correlation ?? 1.0).toFixed(2);
+  const pL = frame.peak_l_db > -59.5 ? frame.peak_l_db.toFixed(1) : "-∞";
+  const pR = frame.peak_r_db > -59.5 ? frame.peak_r_db.toFixed(1) : "-∞";
+  $("scope-meta").textContent = `Phase ${frame.correlation >= 0 ? "+" : ""}${corr} · Peak ${pL} / ${pR} dB`;
+}
+
+function startVisLoop() {
+  const tick = async () => {
+    if ((currentVisMode === "spectrum" || currentVisMode === "scope") && $("now-playing-view").classList.contains("active")) {
+      try {
+        const frame = await invoke("get_visualizer_frame");
+        if (currentVisMode === "spectrum") drawSpectrum(frame);
+        else drawScope(frame);
+      } catch (_) {}
+      setTimeout(tick, 33);
+    } else {
+      setTimeout(tick, 250);
+    }
+  };
+  tick();
 }
 
 function parseLRC(text) {
@@ -964,25 +1083,31 @@ function showStatus(s) {
   $("sp-vol").textContent = $("volume-slider").disabled ? "system volume" : "DAC volume";
   $("sigpath").hidden = false;
   const resampled = s.sample_rate !== hz;
-  $("signal-dot").className = `mark ${s.is_bit_perfect ? "ok" : resampled ? "info" : "warn"}`;
-  $("signal-hud-text").textContent = s.is_bit_perfect
-    ? "Bit-perfect · direct hardware"
-    : resampled
-      ? `In-engine resampled · ${k(s.sample_rate)} → ${k(hz)} kHz`
-      : `Shared device · ${s.active_device_id}`;
+  $("signal-dot").className = `mark ${s.device_disconnected ? "warn" : s.is_bit_perfect ? "ok" : resampled ? "info" : "warn"}`;
+  $("signal-hud-text").textContent = s.device_disconnected
+    ? `DAC disconnected · waiting for ${s.active_device_id}…`
+    : s.signal_mode && s.signal_mode !== "Idle"
+      ? `${s.signal_mode} · ${k(hz)} kHz`
+      : s.is_bit_perfect
+        ? "Bit-perfect · direct hardware"
+        : resampled
+          ? `In-engine resampled · ${k(s.sample_rate)} → ${k(hz)} kHz`
+          : `Shared device · ${s.active_device_id}`;
 }
 
 // =====================================================================
 // Volume: DAC hardware mixer (disabled for shared devices, where it would not be bit-perfect)
 // =====================================================================
+let bpLock = false;
+
 async function refreshVolume() {
   const slider = $("volume-slider");
   let v = null;
   try { v = await invoke("get_volume", { deviceId: currentDeviceId }); } catch (_) {}
-  slider.disabled = v === null;
-  slider.title = v === null ? "No hardware volume for this device" : "";
-  if (v !== null) slider.value = v;
-  $("vol-label").textContent = v === null ? "--" : `${v}%`;
+  slider.disabled = v === null || bpLock;
+  slider.title = bpLock ? "Locked at 0 dBFS (Bit-Perfect Lock active)" : v === null ? "No hardware volume for this device" : "";
+  if (v !== null) slider.value = bpLock ? 100 : v;
+  $("vol-label").textContent = bpLock ? "0dB" : v === null ? "--" : `${v}%`;
 }
 
 // ReplayGain: lowers the DAC's own volume for loud masters (never raises it), so the stream stays untouched.
@@ -991,6 +1116,7 @@ let rgGain = 0;
 
 let volTimer;
 function sendVolume() {
+  if (bpLock) return;
   // throttle: one mixer call per ~60ms, not one per slider pixel
   clearTimeout(volTimer);
   volTimer = setTimeout(() => invoke("set_volume", {
@@ -999,6 +1125,7 @@ function sendVolume() {
 }
 
 function setVolume(pct) {
+  if (bpLock) return;
   const slider = $("volume-slider");
   slider.value = pct;
   $("vol-label").textContent = `${slider.value}%`;
@@ -1009,11 +1136,27 @@ function paintRg() {
   const b = $("rg-btn");
   b.textContent = `ReplayGain: ${rgOn ? "on" : "off"}`;
   b.classList.toggle("ghost", !rgOn);
+  b.disabled = bpLock;
 }
 
-function initVolume() {
+function paintBpLock() {
+  const b = $("bp-lock-btn");
+  b.textContent = `0 dBFS Lock: ${bpLock ? "on" : "off"}`;
+  b.classList.toggle("ghost", !bpLock);
+}
+
+async function initVolume() {
   const slider = $("volume-slider");
+  try { bpLock = !!(await invoke("get_settings")).bit_perfect_lock; } catch (_) {}
+  paintBpLock();
   paintRg();
+  $("bp-lock-btn").addEventListener("click", async () => {
+    bpLock = !bpLock;
+    paintBpLock();
+    paintRg();
+    await invoke("set_bit_perfect_lock", { enabled: bpLock, deviceId: currentDeviceId }).catch(() => {});
+    refreshVolume();
+  });
   $("rg-btn").addEventListener("click", () => {
     rgOn = !rgOn;
     store.set("rg", rgOn ? "1" : "0");

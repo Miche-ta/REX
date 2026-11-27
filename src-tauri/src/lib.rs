@@ -1,13 +1,29 @@
+mod audio_backend;
 mod audio_engine;
 mod audio_probe;
+#[cfg(target_os = "macos")]
+mod backend_coreaudio;
+#[cfg(target_os = "linux")]
+mod backend_alsa;
+#[cfg(target_os = "windows")]
+mod backend_wasapi;
+mod cue;
 mod diagnostics;
+mod dsd;
 mod library;
 mod lyrics_online;
+mod media_controls;
+#[cfg(target_os = "linux")]
+mod mpris;
+mod paths;
 mod pcm_format;
 mod pipeline;
+#[cfg(target_os = "linux")]
 mod reserve;
+mod ring_buffer;
+mod rt_priority;
 mod settings;
-mod mpris;
+mod visualizer;
 pub mod logger;
 
 use std::sync::Mutex;
@@ -57,7 +73,16 @@ fn get_cover(file_path: String) -> Option<String> {
 fn mpris_update(title: String, artist: String, album: String, length_secs: f64, file_path: Option<String>,
                 can_next: bool, can_prev: bool, status: String) {
     let art = file_path.as_deref().and_then(cover_file_url).unwrap_or_default();
-    mpris::update(title, artist, album, length_secs, art, can_next, can_prev, &status);
+    media_controls::update(&media_controls::MediaMetadata {
+        title: &title,
+        artist: &artist,
+        album: &album,
+        length_secs,
+        art_url: &art,
+        can_next,
+        can_prev,
+        status: &status,
+    });
 }
 
 /// Desktop widgets want a file URL for the cover, so write it to the cache dir (only the current cover is kept).
@@ -67,9 +92,7 @@ fn cover_file_url(track: &str) -> Option<String> {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut h);
     let ext = if mime.contains("png") { "png" } else { "jpg" };
-    let base = std::env::var("XDG_CACHE_HOME").ok()
-        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.cache")))?;
-    let dir = std::path::Path::new(&base).join("rex-music");
+    let dir = paths::cache_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
     let name = format!("cover-{:x}.{ext}", h.finish());
     let target = dir.join(&name);
@@ -79,14 +102,16 @@ fn cover_file_url(track: &str) -> Option<String> {
         }
         std::fs::write(&target, bytes).ok()?;
     }
-    Some(format!("file://{}", target.display()))
+    if cfg!(windows) {
+        Some(format!("file:///{}", target.display().to_string().replace('\\', "/")))
+    } else {
+        Some(format!("file://{}", target.display()))
+    }
 }
 
-// ---- Playlists: plain .m3u files in ~/.local/share/rex-music/playlists ----
+// ---- Playlists: plain .m3u files in the local data directory ----
 fn playlist_dir() -> Option<std::path::PathBuf> {
-    let base = std::env::var("XDG_DATA_HOME").ok()
-        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.local/share")))?;
-    let dir = std::path::Path::new(&base).join("rex-music").join("playlists");
+    let dir = paths::data_dir()?.join("playlists");
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
@@ -146,7 +171,7 @@ fn load_playlist(name: String) -> Result<Vec<String>, String> {
     let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     Ok(text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| if l.starts_with('/') { l.to_string() } else { dir.join(l).display().to_string() })
+        .map(|l| if std::path::Path::new(l).is_absolute() { l.to_string() } else { dir.join(l).display().to_string() })
         .collect())
 }
 
@@ -196,12 +221,13 @@ fn get_playback_status(state: State<'_, AppState>) -> PlaybackStatus {
 }
 
 #[tauri::command(async)]
+fn get_visualizer_frame(state: State<'_, AppState>) -> visualizer::VisFrame {
+    state.engine.get_visualizer_frame()
+}
+
+#[tauri::command(async)]
 fn scan_music_directory(state: State<'_, AppState>, dir_path: Option<String>) -> Vec<TrackInfo> {
-    let target_dir = dir_path.unwrap_or_else(|| {
-        std::env::var("HOME")
-            .map(|h| format!("{}/Music", h))
-            .unwrap_or_else(|_| ".".into())
-    });
+    let target_dir = dir_path.unwrap_or_else(|| paths::default_music_dir().display().to_string());
 
     let tracks = scan_directory(&target_dir);
     if let Ok(mut cache) = state.cached_library.lock() {
@@ -212,9 +238,7 @@ fn scan_music_directory(state: State<'_, AppState>, dir_path: Option<String>) ->
 
 #[tauri::command(async)]
 fn get_default_music_dir() -> String {
-    std::env::var("HOME")
-        .map(|h| format!("{}/Music", h))
-        .unwrap_or_else(|_| ".".into())
+    paths::default_music_dir().display().to_string()
 }
 
 #[tauri::command(async)]
@@ -229,21 +253,28 @@ fn clear_engine_logs() {
 
 #[tauri::command(async)]
 fn get_kernel_hw_params() -> String {
-    let mut out = String::new();
-    for i in 0..8 {
-        let dir = format!("/proc/asound/card{i}");
-        let Ok(id) = std::fs::read_to_string(format!("{dir}/id")) else { continue };
-        out.push_str(&format!("=== card{i} [{}] ===\n", id.trim()));
-        if let Ok(c) = std::fs::read_to_string(format!("{dir}/pcm0p/sub0/hw_params")) {
-            out.push_str(&format!("-- pcm0p/sub0/hw_params --\n{}\n", c.trim()));
+    #[cfg(target_os = "linux")]
+    {
+        let mut out = String::new();
+        for i in 0..8 {
+            let dir = format!("/proc/asound/card{i}");
+            let Ok(id) = std::fs::read_to_string(format!("{dir}/id")) else { continue };
+            out.push_str(&format!("=== card{i} [{}] ===\n", id.trim()));
+            if let Ok(c) = std::fs::read_to_string(format!("{dir}/pcm0p/sub0/hw_params")) {
+                out.push_str(&format!("-- pcm0p/sub0/hw_params --\n{}\n", c.trim()));
+            }
+            // USB cards: the descriptor view (altsets, endpoints, clock source) of what the DAC advertises
+            if let Ok(c) = std::fs::read_to_string(format!("{dir}/stream0")) {
+                out.push_str(&format!("-- stream0 --\n{}\n", c.trim()));
+            }
+            out.push('\n');
         }
-        // USB cards: the descriptor view (altsets, endpoints, clock source) of what the DAC advertises
-        if let Ok(c) = std::fs::read_to_string(format!("{dir}/stream0")) {
-            out.push_str(&format!("-- stream0 --\n{}\n", c.trim()));
-        }
-        out.push('\n');
+        if out.is_empty() { "No ALSA cards found in /proc/asound".into() } else { out }
     }
-    if out.is_empty() { "No ALSA cards found in /proc/asound".into() } else { out }
+    #[cfg(not(target_os = "linux"))]
+    {
+        format!("Kernel ALSA hw_params is Linux-only (running on {})", std::env::consts::OS)
+    }
 }
 
 /// Tracks from the last scan of this folder, read from the on-disk cache (no music files touched).
@@ -272,6 +303,18 @@ fn set_reserve_dbus(enabled: bool) {
     settings::update(|s| s.reserve_dbus = enabled);
 }
 
+/// Lock or unlock the hardware mixer at 0 dBFS (100% unity gain, disabling ReplayGain & volume attenuation).
+#[tauri::command(async)]
+fn set_bit_perfect_lock(enabled: bool, device_id: Option<String>) -> bool {
+    settings::update(|s| s.bit_perfect_lock = enabled);
+    if enabled {
+        if let Some(dev) = device_id {
+            return audio_engine::lock_hw_volume_0db(&dev);
+        }
+    }
+    true
+}
+
 /// Output buffer and period in milliseconds; used the next time the sound card is opened.
 #[tauri::command(async)]
 fn set_audio_buffer(buffer_ms: u32, period_ms: u32) -> settings::Settings {
@@ -282,18 +325,23 @@ fn set_audio_buffer(buffer_ms: u32, period_ms: u32) -> settings::Settings {
 #[tauri::command(async)]
 fn get_diagnostics() -> String {
     let cfg = settings::get();
+    #[cfg(target_os = "linux")]
     let kernel = std::fs::read_to_string("/proc/version").unwrap_or_default();
+    #[cfg(not(target_os = "linux"))]
+    let kernel = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
     let logs: Vec<String> = logger::get_logs().iter().rev().take(60).rev()
         .map(|e| format!("{} [{}] {}", e.timestamp, e.level, e.message)).collect();
-    // best effort: USB/audio lines from the kernel log, where controller errors show up
+    #[cfg(target_os = "linux")]
     let klog = std::process::Command::new("journalctl").args(["-k", "-n", "300", "--no-pager"]).output().ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).lines()
             .filter(|l| { let l = l.to_lowercase(); l.contains("xhci") || l.contains("snd-usb") || l.contains("snd_usb") || l.contains("usb 1-") })
             .rev().take(40).collect::<Vec<_>>().into_iter().rev().map(str::to_string).collect::<Vec<_>>().join("\n"))
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| "(none found, or journalctl is not available)".into());
+    #[cfg(not(target_os = "linux"))]
+    let klog = "(kernel log is Linux-only)".to_string();
     format!(
-        "rex-music {}\n{}\nbuffer {} ms / period {} ms\n\n== health counters ==\n{}\n== alsa ==\n{}\n== recent log ==\n{}\n\n== kernel (usb/audio) ==\n{}\n",
+        "rex-music {}\n{}\nbuffer {} ms / period {} ms\n\n== health counters ==\n{}\n== backend ==\n{}\n== recent log ==\n{}\n\n== kernel (usb/audio) ==\n{}\n",
         env!("CARGO_PKG_VERSION"), kernel.trim(), cfg.buffer_ms, cfg.period_ms,
         diagnostics::counters_text(), get_kernel_hw_params(), logs.join("\n"), klog
     )
@@ -321,7 +369,7 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let _ = audio_engine::APP.set(app.handle().clone());
-            mpris::start_mpris_server(app.handle().clone());
+            media_controls::start(app.handle().clone());
             Ok(())
         })
         .manage(app_state)
@@ -348,6 +396,7 @@ pub fn run() {
             stop_track,
             seek_track,
             get_playback_status,
+            get_visualizer_frame,
             scan_music_directory,
             get_default_music_dir,
             get_engine_logs,
@@ -359,6 +408,7 @@ pub fn run() {
             set_ui_value,
             set_audio_buffer,
             set_reserve_dbus,
+            set_bit_perfect_lock,
             list_volume_controls,
             set_volume_control,
         ])
@@ -366,7 +416,7 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|_, event| {
             if let tauri::RunEvent::Exit = event {
-                audio_engine::release_device_to_pipewire();
+                audio_backend::release_all();
             }
         });
 }

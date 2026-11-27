@@ -15,12 +15,13 @@ pub struct Settings {
     pub buffer_ms: u32,
     pub period_ms: u32,
     pub reserve_dbus: bool, // free the card via ReserveDevice1 instead of pactl
+    pub bit_perfect_lock: bool, // lock hardware mixer at 0 dBFS unity gain
     pub ui: BTreeMap<String, String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { version: VERSION, buffer_ms: 500, period_ms: 100, reserve_dbus: false, ui: BTreeMap::new() }
+        Self { version: VERSION, buffer_ms: 500, period_ms: 100, reserve_dbus: false, bit_perfect_lock: false, ui: BTreeMap::new() }
     }
 }
 
@@ -35,9 +36,7 @@ impl Settings {
 static CURRENT: Mutex<Option<Settings>> = Mutex::new(None);
 
 fn path() -> Option<PathBuf> {
-    let base = std::env::var("XDG_CONFIG_HOME").ok()
-        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.config")))?;
-    Some(PathBuf::from(base).join("rex-music").join("config.json"))
+    crate::paths::config_dir().map(|d| d.join("config.json"))
 }
 
 fn parse(text: &str) -> Settings {

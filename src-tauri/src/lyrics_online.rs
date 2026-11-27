@@ -42,9 +42,7 @@ pub fn cache_key(title: &str, artist: &str, album: &str, duration_secs: u32) -> 
 }
 
 fn cache_dir() -> Option<PathBuf> {
-    let base = std::env::var("XDG_CACHE_HOME").ok()
-        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.cache")))?;
-    Some(PathBuf::from(base).join("rex-music").join("lyrics"))
+    crate::paths::cache_dir().map(|d| d.join("lyrics"))
 }
 
 pub enum Cached {

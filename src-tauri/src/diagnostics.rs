@@ -5,6 +5,7 @@ use std::time::Duration;
 pub static XRUNS: AtomicU32 = AtomicU32::new(0); // underruns reported by ALSA (EPIPE)
 pub static RECOVERED: AtomicU32 = AtomicU32::new(0); // write errors that try_recover fixed
 pub static WRITE_FAILS: AtomicU32 = AtomicU32::new(0); // write errors that stopped playback
+pub static DISCONNECTS: AtomicU32 = AtomicU32::new(0); // USB DAC unplug / disconnect events
 pub static REUSED: AtomicU32 = AtomicU32::new(0); // tracks that kept the open PCM (gapless)
 pub static REOPENED: AtomicU32 = AtomicU32::new(0); // tracks that had to open the PCM
 pub static MAX_DECODE_US: AtomicU64 = AtomicU64::new(0); // slowest single packet decode
@@ -16,10 +17,11 @@ pub fn note_decode(d: Duration) {
 pub fn counters_text() -> String {
     format!(
         "underruns (xrun): {}\nwrite errors recovered: {}\nwrite errors that stopped playback: {}\n\
-         tracks that reused the open device: {}\ntracks that reopened the device: {}\nslowest packet decode: {:.2} ms\n",
+         device disconnects: {}\ntracks that reused the open device: {}\ntracks that reopened the device: {}\nslowest packet decode: {:.2} ms\n",
         XRUNS.load(Relaxed),
         RECOVERED.load(Relaxed),
         WRITE_FAILS.load(Relaxed),
+        DISCONNECTS.load(Relaxed),
         REUSED.load(Relaxed),
         REOPENED.load(Relaxed),
         MAX_DECODE_US.load(Relaxed) as f64 / 1000.0,

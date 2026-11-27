@@ -45,9 +45,7 @@ pub(crate) fn fnv1a(s: &str) -> u64 {
 }
 
 fn cache_path(dir: &str) -> Option<PathBuf> {
-    let base = std::env::var("XDG_CACHE_HOME").ok()
-        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.cache")))?;
-    Some(PathBuf::from(base).join("rex-music").join(format!("library-{:016x}.json", fnv1a(dir))))
+    crate::paths::cache_dir().map(|d| d.join(format!("library-{:016x}.json", fnv1a(dir))))
 }
 
 fn load_cache(dir: &str) -> HashMap<String, CacheEntry> {
@@ -95,6 +93,8 @@ pub fn scan_directory(dir_path: &str) -> Vec<TrackInfo> {
     let old = load_cache(dir_path);
     let mut fresh: HashMap<String, CacheEntry> = HashMap::new();
     let mut dirs_to_visit = vec![root.to_path_buf()];
+    let mut cue_files: Vec<PathBuf> = Vec::new();
+    let mut audio_files: Vec<(PathBuf, String)> = Vec::new();
 
     while let Some(current_dir) = dirs_to_visit.pop() {
         if let Ok(entries) = fs::read_dir(&current_dir) {
@@ -104,24 +104,66 @@ pub fn scan_directory(dir_path: &str) -> Vec<TrackInfo> {
                     dirs_to_visit.push(path);
                 } else if path.is_file() {
                     if let Some(ext) = path.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()) {
-                        if matches!(ext.as_str(), "flac" | "wav" | "ogg" | "mp3" | "m4a" | "aac" | "alac") {
-                            let key = path.to_string_lossy().to_string();
-                            let (mtime, size) = fs::metadata(&path).ok().map(|m| (
-                                m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs()),
-                                m.len(),
-                            )).unwrap_or((0, 0));
-                            let info = match old.get(&key) {
-                                Some(e) if is_fresh(e, mtime, size) => Some(e.info.clone()),
-                                _ => extract_track_info(&path, &ext),
-                            };
-                            if let Some(info) = info {
-                                fresh.insert(key, CacheEntry { mtime, size, info: info.clone() });
-                                tracks.push(info);
-                            }
+                        if ext == "cue" {
+                            cue_files.push(path);
+                        } else if matches!(ext.as_str(), "flac" | "wav" | "ogg" | "mp3" | "m4a" | "aac" | "alac" | "dsf" | "dff") {
+                            audio_files.push((path, ext));
                         }
                     }
                 }
             }
+        }
+    }
+
+    // Parse CUE sheets first so we can suppress duplicate monolithic album files.
+    let mut cue_referenced: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for cue_path in &cue_files {
+        if let Some(cue_tracks) = crate::cue::parse_cue_file(cue_path) {
+            let mut probed: HashMap<PathBuf, Option<TrackInfo>> = HashMap::new();
+            for ct in cue_tracks {
+                if !ct.file_path.exists() { continue; }
+                cue_referenced.insert(ct.file_path.clone());
+                let base_opt = probed.entry(ct.file_path.clone()).or_insert_with(|| {
+                    let ext = ct.file_path.extension().and_then(|e| e.to_str()).unwrap_or("flac").to_lowercase();
+                    extract_track_info(&ct.file_path, &ext)
+                });
+                let Some(base) = base_opt else { continue };
+                let dur = ct.end_seconds
+                    .map(|e| (e - ct.start_seconds).max(0.0))
+                    .unwrap_or_else(|| (base.duration_seconds - ct.start_seconds).max(0.0));
+                let vp = crate::cue::format_virtual_path(&ct.file_path, ct.start_seconds, ct.end_seconds);
+                tracks.push(TrackInfo {
+                    id: vp.clone(),
+                    file_path: vp,
+                    title: ct.title,
+                    artist: ct.artist,
+                    album: ct.album,
+                    duration_seconds: dur,
+                    sample_rate: base.sample_rate,
+                    bit_depth: base.bit_depth,
+                    channels: base.channels,
+                    format: format!("{} (CUE)", base.format),
+                });
+            }
+        }
+    }
+
+    for (path, ext) in audio_files {
+        if cue_referenced.contains(&path) {
+            continue;
+        }
+        let key = path.to_string_lossy().to_string();
+        let (mtime, size) = fs::metadata(&path).ok().map(|m| (
+            m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs()),
+            m.len(),
+        )).unwrap_or((0, 0));
+        let info = match old.get(&key) {
+            Some(e) if is_fresh(e, mtime, size) => Some(e.info.clone()),
+            _ => extract_track_info(&path, &ext),
+        };
+        if let Some(info) = info {
+            fresh.insert(key, CacheEntry { mtime, size, info: info.clone() });
+            tracks.push(info);
         }
     }
 
@@ -131,6 +173,22 @@ pub fn scan_directory(dir_path: &str) -> Vec<TrackInfo> {
 }
 
 fn extract_track_info(path: &Path, ext: &str) -> Option<TrackInfo> {
+    if crate::dsd::is_dsd_path(path) {
+        let dsd = crate::dsd::probe_dsd(path)?;
+        let title = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Unknown").to_string();
+        return Some(TrackInfo {
+            id: path.to_string_lossy().to_string(),
+            file_path: path.to_string_lossy().to_string(),
+            title,
+            artist: "Unknown Artist".to_string(),
+            album: path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()).unwrap_or("DSD Audio").to_string(),
+            duration_seconds: dsd.duration_seconds,
+            sample_rate: dsd.dsd_rate,
+            bit_depth: 1,
+            channels: dsd.channels,
+            format: dsd.dsd_label,
+        });
+    }
     let file = fs::File::open(path).ok()?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -190,7 +248,8 @@ fn extract_track_info(path: &Path, ext: &str) -> Option<TrackInfo> {
 /// Cover art as a data URL: embedded picture first, then cover/folder/front image beside the file.
 /// Cover image bytes and mime type: embedded picture first, else cover/folder/front/album image beside the file.
 pub fn cover_bytes(file_path: &str) -> Option<(Vec<u8>, String)> {
-    let path = Path::new(file_path);
+    let (real_path, _) = crate::cue::parse_virtual_path(file_path);
+    let path = Path::new(real_path);
     let mime_of = |p: &Path| match p.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref() {
         Some("png") => "image/png",
         _ => "image/jpeg",
@@ -228,7 +287,8 @@ pub fn get_cover(file_path: &str) -> Option<String> {
 }
 
 pub fn get_lyrics(file_path: &str) -> Option<String> {
-    let path = Path::new(file_path);
+    let (real_path, _) = crate::cue::parse_virtual_path(file_path);
+    let path = Path::new(real_path);
     // 1. Same directory, same file stem with .lrc extension
     let lrc_path = path.with_extension("lrc");
     if let Ok(content) = fs::read_to_string(&lrc_path) {

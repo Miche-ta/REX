@@ -41,6 +41,8 @@
               <div class="seg vtabs" id="vtabs" role="group" aria-label="Visualizer mode">
                 <button data-vis="art" class="on">Art</button>
                 <button data-vis="vu">VU Meter</button>
+                <button data-vis="spectrum">Spectrum</button>
+                <button data-vis="scope">Scope</button>
                 <button data-vis="lyrics">Lyrics</button>
               </div>
               <div class="art" id="art-wrapper" title="Click to switch between disc and cover">
@@ -74,6 +76,14 @@
                   <div class="vu-needle-box" id="vu-needle-right"><div class="vu-needle-line"></div></div>
                   <div class="vu-cap"></div>
                 </div>
+              </div>
+              <div class="vis-panel" id="spectrum-panel" hidden>
+                <canvas id="spectrum-canvas" width="360" height="240"></canvas>
+                <div class="vis-meta" id="spectrum-meta">32-band FFT · -60 to 0 dBFS</div>
+              </div>
+              <div class="vis-panel" id="scope-panel" hidden>
+                <canvas id="scope-canvas" width="360" height="240"></canvas>
+                <div class="vis-meta" id="scope-meta">Phase +1.00 · Peak -∞ / -∞ dB</div>
               </div>
               <div class="lyrics-panel" id="lyrics-panel" hidden>
                 <div class="lyrics-scroll" id="lyrics-content">
@@ -200,6 +210,7 @@
               <p class="sub">Direct <code>hw:</code> devices skip the system mixer and resampler.</p>
             </div>
             <div class="bar tight">
+              <button id="bp-lock-btn" class="btn ghost" title="Lock hardware mixer at 0 dBFS unity gain (100%) and disable attenuation for pure bit-perfect output.">0 dBFS Lock: off</button>
               <button id="rg-btn" class="btn ghost" title="Lower the DAC volume for loud masters (never raises it). Needs ReplayGain tags and a mixer that reports dB.">ReplayGain: off</button>
               <button id="rescan-hw-btn" class="btn">Rescan</button>
             </div>

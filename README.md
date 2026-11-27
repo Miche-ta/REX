@@ -1,5 +1,7 @@
 # rex-music
 
+Heavily vibe-coded music player.
+
 A bit-perfect, gapless music player built with Tauri v2 (Rust backend, plain HTML/CSS/JS frontend). It sends decoded PCM and DoP (DSD over PCM) straight to your DAC with no mixer and no resampling—via direct ALSA `hw:` on Linux, with WASAPI Exclusive (Windows) and CoreAudio Hog Mode (macOS) backends.
 
 ## Features

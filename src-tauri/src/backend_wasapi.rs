@@ -9,7 +9,7 @@ use std::slice;
 use std::thread;
 use std::time::Duration;
 
-use windows::core::{Interface, GUID, PCWSTR, PWSTR};
+use windows::core::{GUID, PCWSTR, PWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
@@ -19,7 +19,6 @@ use windows::Win32::Media::Audio::{
     DEVICE_STATE_ACTIVE, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::Media::KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM;
-use windows::Win32::Media::Multimedia::WAVE_FORMAT_EXTENSIBLE;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED, STGM_READ,
@@ -32,6 +31,7 @@ use crate::logger::log_msg;
 use crate::pcm_format::{pick_format, OutFmt};
 
 const WAVE_FORMAT_PCM_TAG: u16 = 1;
+const WAVE_FORMAT_EXTENSIBLE_TAG: u16 = 0xFFFE;
 const SPEAKER_FRONT_LEFT: u32 = 0x1;
 const SPEAKER_FRONT_RIGHT: u32 = 0x2;
 
@@ -336,7 +336,7 @@ fn build_wave_format(rate: u32, channels: u32, fmt: OutFmt) -> WAVEFORMATEXTENSI
         wFormatTag: if bits_per_sample == 16 {
             WAVE_FORMAT_PCM_TAG
         } else {
-            WAVE_FORMAT_EXTENSIBLE as u16
+            WAVE_FORMAT_EXTENSIBLE_TAG
         },
         nChannels: channels as u16,
         nSamplesPerSec: rate,

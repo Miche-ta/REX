@@ -103,7 +103,7 @@ fn parse_stat_tid(stat: &str) -> Option<u64> {
 pub fn promote_audio_thread() {
     use crate::logger::log_msg;
     #[link(name = "avrt")]
-    extern "system" {
+    unsafe extern "system" {
         fn AvSetMmThreadCharacteristicsW(task_name: *const u16, task_index: *mut u32) -> isize;
     }
     let name: Vec<u16> = "Pro Audio\0".encode_utf16().collect();

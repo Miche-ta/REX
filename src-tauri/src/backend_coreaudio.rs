@@ -69,7 +69,7 @@ mod sys {
     ) -> OSStatus;
 
     #[link(name = "CoreAudio", kind = "framework")]
-    extern "C" {
+    unsafe extern "C" {
         pub fn AudioObjectGetPropertyDataSize(
             inObjectID: AudioObjectID,
             inAddress: *const AudioObjectPropertyAddress,

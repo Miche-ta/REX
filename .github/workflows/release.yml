@@ -70,6 +70,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rex-music-${{ matrix.os_name }}
+          if-no-files-found: error   # a build that produced nothing must fail here, not silently at publish
           path: |
             src-tauri/target/**/release/bundle/deb/*.deb
             src-tauri/target/**/release/bundle/rpm/*.rpm
@@ -89,8 +90,19 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Show what will be attached
+        run: ls -R artifacts
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
+          # upload-artifact keeps the bundle sub-folders (deb/, rpm/, bundle/msi/ ...), so match files recursively
+          files: |
+            artifacts/**/*.deb
+            artifacts/**/*.rpm
+            artifacts/**/*.AppImage
+            artifacts/**/*.msi
+            artifacts/**/*.exe
+            artifacts/**/*.zip
+          fail_on_unmatched_files: true
           generate_release_notes: true

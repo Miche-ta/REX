@@ -278,6 +278,7 @@ kbd { font: 11px var(--mono); color: var(--text-faint); }
 .tracks td.n, .tracks td.r, .tracks td.f { font: 12px var(--mono); }
 .tracks td.n { color: var(--text-faint); }
 .tracks td.dim { color: var(--text-dim); }
+#scan-status { font: 12px var(--mono); color: var(--text-dim); align-self: center; }
 .track-row { cursor: pointer; }
 .track-row:hover { background: var(--hover); }
 .track-row.playing td { color: var(--accent); }

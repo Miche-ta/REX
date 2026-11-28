@@ -22,12 +22,13 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.23"
+percent-encoding = "2"
 symphonia = { version = "0.6.1", features = ["all"] }
 rubato = "0.16"
 ureq = "2"
 rustfft = "6.4"
 dirs = "7"
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 alsa = "0.12.1"

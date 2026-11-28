@@ -43,6 +43,7 @@ function showView(name) {
   document.querySelectorAll(".view-section").forEach((s) => s.classList.toggle("active", s.id === `${name}-view`));
   store.set("view", name);
   if (name === "terminal") { const o = $("log-output"); o.scrollTop = o.scrollHeight; }
+  if (name === "library") drawWindow();
 }
 
 function initNavigation() {
@@ -239,24 +240,34 @@ function formatDuration(sec) {
   return `${m}:${s < 10 ? "0" : ""}${s}`;
 }
 
+// Covers come from the backend's cover:// protocol (no base64 over IPC). Resolves to the URL, or null
+// when the track has none (the protocol answers 404). Remembered per track for the session.
+const coverCache = new Map();
+function coverUrl(path) {
+  if (!coverCache.has(path)) coverCache.set(path, new Promise((done) => {
+    const img = new Image();
+    img.onload = () => done(img.src);
+    img.onerror = () => done(null);
+    img.src = window.__TAURI__.core.convertFileSrc(path, "cover");
+  }));
+  return coverCache.get(path);
+}
+
 // ---- album grid: one cover tile per album, covers load lazily as tiles scroll into view ----
-const albumArt = new Map();
 let gridGroups = new Map();
 const tileObserver = new IntersectionObserver((entries) => {
   for (const e of entries) {
     if (!e.isIntersecting) continue;
     tileObserver.unobserve(e.target);
-    const el = e.target, path = el.dataset.path;
-    const apply = (u) => { if (u) { el.style.backgroundImage = `url("${u}")`; el.classList.add("has"); } };
-    if (albumArt.has(path)) apply(albumArt.get(path));
-    else invoke("get_cover", { filePath: path }).catch(() => null).then((u) => { albumArt.set(path, u); apply(u); });
+    const el = e.target;
+    coverUrl(el.dataset.path).then((u) => { if (u) { el.style.backgroundImage = `url("${u}")`; el.classList.add("has"); } });
   }
 }, { rootMargin: "200px" });
 
 function renderAlbumGrid(rows) {
   gridGroups = new Map();
   rows.forEach((r) => {
-    const key = `${r.t.album}\u0000${r.t.artist}`;
+    const key = `${r.t.album}\u001f${r.t.artist}`;
     if (!gridGroups.has(key)) gridGroups.set(key, []);
     gridGroups.get(key).push(r);
   });
@@ -285,28 +296,63 @@ function playIndices(idxs) {
   playTrackByIndex(order[0]);
 }
 
-// Big libraries: put the first rows in the DOM and add more as you scroll near the end.
-const ROW_CHUNK = 300;
-let pendingRows = [];
-const moreObserver = new IntersectionObserver((entries) => { if (entries.some((e) => e.isIntersecting)) appendRows(); }, { rootMargin: "600px" });
+// Big libraries: only the rows near the viewport are in the DOM; two spacer rows stand in for the rest.
+// Rows are { html, i } (a track) or { html, group: true } (a header). Heights are measured from real rows.
+const stage = document.querySelector(".stage");
+const OVERSCAN = 30;
+let libRows = [], libOrder = [], libTops = [0];
+let rowH = 33, groupH = 53, winStart = -1, winEnd = -1;
 
-function paintRows(parts) {
-  pendingRows = parts.slice(ROW_CHUNK);
-  $("library-tbody").innerHTML = parts.slice(0, ROW_CHUNK).join("") +
-    (pendingRows.length ? '<tr id="lib-more"><td colspan="7" class="empty">…</td></tr>' : "");
-  moreObserver.disconnect();
-  const more = $("lib-more");
-  if (more) moreObserver.observe(more);
+function layoutTops() {
+  libTops = [0];
+  for (const r of libRows) libTops.push(libTops[libTops.length - 1] + (r.group ? groupH : rowH));
 }
 
-function appendRows() {
-  const more = $("lib-more");
-  if (!more) return;
-  more.insertAdjacentHTML("beforebegin", pendingRows.splice(0, ROW_CHUNK).join(""));
-  moreObserver.unobserve(more);
-  if (pendingRows.length) moreObserver.observe(more); // re-check: still in view means load the next chunk
-  else more.remove();
+function paintRows(rows) {
+  libRows = rows;
+  libOrder = rows.filter((r) => !r.group).map((r) => r.i); // what clicking a row queues, in display order
+  layoutTops();
+  winStart = winEnd = -1;
+  drawWindow();
 }
+
+// first row whose bottom is below y (binary search over the running heights)
+function rowAt(y) {
+  let lo = 0, hi = libRows.length - 1;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (libTops[m + 1] > y) hi = m; else lo = m + 1; }
+  return lo;
+}
+
+function drawWindow() {
+  const tbody = $("library-tbody");
+  if (!libRows.length) return;
+  if (!tbody.offsetParent) { winStart = winEnd = -1; return; } // hidden: draw when shown
+  const box = stage.getBoundingClientRect();
+  const y = box.top - tbody.getBoundingClientRect().top; // stage top in tbody coordinates
+  const first = rowAt(Math.max(0, y)), last = rowAt(y + box.height);
+  const n = libRows.length;
+  const near = (first - 10 < winStart && winStart > 0) || (last + 10 > winEnd && winEnd < n);
+  if (winStart >= 0 && !near) return;
+  winStart = Math.max(0, first - OVERSCAN);
+  winEnd = Math.min(n, last + OVERSCAN + 1);
+  const spacer = (h) => h > 0 ? `<tr aria-hidden="true"><td colspan="7" style="height:${h}px;padding:0;border:0"></td></tr>` : "";
+  const keep = document.activeElement?.closest?.("#library-tbody tr.track-row")?.dataset.index;
+  tbody.innerHTML = spacer(libTops[winStart]) + libRows.slice(winStart, winEnd).map((r) => r.html).join("") +
+    spacer(libTops[n] - libTops[winEnd]);
+  if (keep !== undefined) tbody.querySelector(`tr.track-row[data-index="${keep}"]`)?.focus({ preventScroll: true });
+  // the theme or font decides real row heights: re-measure, and redraw if the guess was off
+  const t = tbody.querySelector("tr.track-row")?.getBoundingClientRect().height;
+  const g = tbody.querySelector("tr.group")?.getBoundingClientRect().height;
+  if ((t && t !== rowH) || (g && g !== groupH)) {
+    rowH = t || rowH; groupH = g || groupH;
+    layoutTops(); winStart = winEnd = -1; drawWindow();
+  }
+}
+
+let drawQueued = false;
+const queueDraw = () => { if (!drawQueued) { drawQueued = true; requestAnimationFrame(() => { drawQueued = false; drawWindow(); }); } };
+stage.addEventListener("scroll", queueDraw, { passive: true });
+addEventListener("resize", () => { winStart = winEnd = -1; queueDraw(); });
 
 function renderLibrary() {
   const tbody = $("library-tbody");
@@ -314,6 +360,7 @@ function renderLibrary() {
   $("lib-grid").hidden = !grid;
   document.querySelector("table.tracks").hidden = grid;
   const empty = (msg) => {
+    libRows = []; libOrder = [];
     if (grid) $("lib-grid").innerHTML = `<p class="pl-empty">${msg}</p>`;
     else tbody.innerHTML = `<tr><td colspan="7" class="empty">${msg}</td></tr>`;
   };
@@ -322,7 +369,8 @@ function renderLibrary() {
   // rows keep their index into currentTrackList, so sorting/filtering never changes what plays
   let rows = currentTrackList.map((t, i) => ({ t, i }));
   const q = lib.q.trim().toLowerCase();
-  if (q) rows = rows.filter(({ t }) => `${t.title} ${t.artist} ${t.album}`.toLowerCase().includes(q));
+  if (q && searchHits) rows = rows.filter(({ t }) => searchHits.has(t.file_path));
+  else if (q) rows = rows.filter(({ t }) => `${t.title} ${t.artist} ${t.album}`.toLowerCase().includes(q));
   if (lib.filter === "hires") rows = rows.filter(({ t }) => isHiRes(t));
   if (lib.filter === "cd") rows = rows.filter(({ t }) => isCD(t));
   if (lib.sortKey) {
@@ -368,43 +416,65 @@ function renderLibrary() {
       const own = byDir.get(node) || [];
       const total = [...byDir].filter(([d]) => d === node || d.startsWith(node + "/")).reduce((n, [, g]) => n + g.length, 0);
       const closed = lib.collapsed.has(key);
-      out.push(`<tr class="group" data-group="${esc(key)}"><td colspan="7" style="padding-left:${14 + (segs.length - root - 1) * 18}px">${closed ? "+" : "\u2212"} ${esc(segs[segs.length - 1])}<span class="g-meta">${total} ${total === 1 ? "track" : "tracks"}</span></td></tr>`);
-      if (!closed) own.forEach((r, n) => out.push(row(r, n + 1)));
+      out.push({ group: true, html: `<tr class="group" data-group="${esc(key)}"><td colspan="7" style="padding-left:${14 + (segs.length - root - 1) * 18}px">${closed ? "+" : "\u2212"} ${esc(segs[segs.length - 1])}<span class="g-meta">${total} ${total === 1 ? "track" : "tracks"}</span></td></tr>` });
+      if (!closed) own.forEach((r, n) => out.push({ i: r.i, html: row(r, n + 1) }));
     });
     paintRows(out);
   } else if (lib.view === "albums") {
     const groups = new Map();
     rows.forEach((r) => {
-      const key = `${r.t.album}\u0000${r.t.artist}`;
+      const key = `${r.t.album}\u001f${r.t.artist}`;
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(r);
     });
-    paintRows([...groups].map(([key, g]) => {
+    paintRows([...groups].flatMap(([key, g]) => {
       const mins = Math.round(g.reduce((s, r) => s + r.t.duration_seconds, 0) / 60);
-      const head = `
+      const head = { group: true, html: `
         <tr class="group" data-group="${esc(key)}">
           <td colspan="7">${lib.collapsed.has(key) ? "+" : "−"} ${esc(g[0].t.album)}
             <span class="g-meta">${esc(g[0].t.artist)} · ${g.length} ${g.length === 1 ? "track" : "tracks"} · ${mins} min</span></td>
-        </tr>`;
-      return head + (lib.collapsed.has(key) ? "" : g.map((r, n) => row(r, n + 1)).join(""));
+        </tr>` };
+      return [head, ...(lib.collapsed.has(key) ? [] : g.map((r, n) => ({ i: r.i, html: row(r, n + 1) })))];
     }));
   } else {
-    paintRows(rows.map((r, n) => row(r, n + 1)));
+    paintRows(rows.map((r, n) => ({ i: r.i, html: row(r, n + 1) })));
   }
 }
 
 // The backend keeps the last scan of each folder on disk, so the library shows instantly on launch
 // while a fresh scan (which only re-reads changed files) runs behind it.
 
+// Search runs on the backend's full-text index (word prefixes, any order, accents ignored).
+// searchHits = matching file paths, or null to use the plain substring filter (no index yet).
+let libDir = "", searchHits = null, searchToken = 0;
+async function runSearch() {
+  const token = ++searchToken, q = lib.q.trim();
+  const hits = q && libDir ? await invoke("search_library", { dirPath: libDir, query: q }).catch(() => null) : null;
+  if (token !== searchToken) return; // a newer keystroke won
+  searchHits = hits ? new Set(hits) : null;
+  renderLibrary();
+}
+
+let scanToken = 0, scanning = false;
+function setScanning(on) {
+  scanning = on;
+  $("scan-folder-btn").textContent = on ? "Cancel" : "Scan";
+  if (!on) $("scan-status").textContent = "";
+}
+
 async function scan(dir, background = false) {
-  if (!background) $("library-tbody").innerHTML = '<tr><td colspan="7" class="empty">Scanning…</td></tr>';
+  const token = ++scanToken;
+  setScanning(true);
+  if (!background) { libRows = []; $("library-tbody").innerHTML = '<tr><td colspan="7" class="empty">Scanning…</td></tr>'; }
   const playingPath = currentTrackList[currentTrackIndex]?.file_path;
-  try {
-    const fresh = (await invoke("scan_music_directory", { dirPath: dir })) || [];
+  let fresh = null;
+  try { fresh = await invoke("scan_music_directory", { dirPath: dir }); } catch (_) {} // "cancelled": keep the old list
+  if (token !== scanToken) return; // a newer scan replaced this one
+  setScanning(false);
+  if (fresh) {
     currentTrackList = fresh;
     queueSrc = null; // indices changed
-  } catch (_) {
-    if (!background) currentTrackList = [];
+    libDir = dir;
   }
   // keep the queue pointing at whatever is playing
   currentTrackIndex = playingPath ? currentTrackList.findIndex((t) => t.file_path === playingPath) : -1;
@@ -412,6 +482,7 @@ async function scan(dir, background = false) {
   renderRecent();
   if (currentTrackIndex >= 0) { renderUpNext(); syncNextHint(); }
   renderLibrary();
+  if (fresh && lib.q.trim()) runSearch(); // the index changed with the scan
 }
 
 async function initLibrary() {
@@ -420,7 +491,11 @@ async function initLibrary() {
 
   try { scanInput.value = savedDir || (await invoke("get_default_music_dir")); } catch (_) {}
 
+  window.__TAURI__.event.listen("scan-progress", ({ payload: [done, total] }) => {
+    if (scanning) $("scan-status").textContent = total ? `${done.toLocaleString()} / ${total.toLocaleString()} files` : "Finding files…";
+  });
   const scanNow = () => {
+    if (scanning) return invoke("cancel_scan");
     const dir = scanInput.value.trim();
     if (!dir) return;
     store.set("scanDir", dir);
@@ -429,7 +504,7 @@ async function initLibrary() {
   $("scan-folder-btn").addEventListener("click", scanNow);
   scanInput.addEventListener("keydown", (e) => { if (e.key === "Enter") scanNow(); });
 
-  $("library-search").addEventListener("input", (e) => { lib.q = e.target.value; renderLibrary(); });
+  $("library-search").addEventListener("input", (e) => { lib.q = e.target.value; runSearch(); });
 
   const segment = (id, attr, onPick) => {
     const box = $(id);
@@ -465,7 +540,7 @@ async function initLibrary() {
     if (!r) return;
     const idx = Number(r.dataset.index);
     // queue what the table shows right now, in its current order
-    queueSrc = [...tbody.querySelectorAll("tr.track-row")].map((x) => Number(x.dataset.index));
+    queueSrc = [...libOrder];
     buildOrder(idx);
     playTrackByIndex(idx);
   };
@@ -479,12 +554,12 @@ async function initLibrary() {
   // open with the last folder, or the bundled demo files on first run
   if (savedDir) {
     const cached = await invoke("get_cached_library", { dirPath: savedDir }).catch(() => []);
-    if (cached?.length) { currentTrackList = cached; buildOrder(); renderLibrary(); renderRecent(); }
+    if (cached?.length) { currentTrackList = cached; libDir = savedDir; buildOrder(); renderLibrary(); renderRecent(); }
     scan(savedDir, !!cached?.length);
   } else {
     try {
       const tracks = await invoke("scan_music_directory", { dirPath: "demo" });
-      if (tracks?.length) { currentTrackList = tracks; renderLibrary(); }
+      if (tracks?.length) { currentTrackList = tracks; libDir = "demo"; renderLibrary(); }
     } catch (_) {}
   }
 }
@@ -606,8 +681,7 @@ function renderUpNext() {
 // Cover art: disc label, or square cover (click the artwork to switch)
 // =====================================================================
 async function loadCover(filePath) {
-  let url = null;
-  try { url = await invoke("get_cover", { filePath }); } catch (_) {}
+  const url = await coverUrl(filePath);
   const img = $("cover-img");
   const center = document.querySelector(".vinyl-center");
   const wrap = $("art-wrapper");
@@ -1274,6 +1348,7 @@ function pushMpris(status) {
   }).catch(() => {});
 }
 
+let openFailures = -1; // -1 until the first status, so old failures do not toast at startup
 async function pollStatus() {
     try {
       const status = await invoke("get_playback_status");
@@ -1293,6 +1368,10 @@ async function pollStatus() {
         toast("Playback stopped unexpectedly. The Terminal tab has the details.", "Open", () => showView("terminal"));
       }
       wasPlaying = status.is_playing;
+      if (status.open_failures > openFailures && openFailures >= 0) {
+        toast("The output device refused this track's format. The Terminal tab has the details.", "Open", () => showView("terminal"));
+      }
+      openFailures = status.open_failures;
 
       // The engine moved to the next track by itself (gapless): follow it in the UI.
       if (status.track_serial !== lastSerial) {
@@ -1457,7 +1536,7 @@ function stepList(d) {
 let lastG = 0;
 function gChord() {
   const now = Date.now();
-  if (now - lastG < 600) { lastG = 0; focusItem(listItems(), 0); } else lastG = now;
+  if (now - lastG < 600) { lastG = 0; stage.scrollTop = 0; drawWindow(); focusItem(listItems(), 0); } else lastG = now;
 }
 
 function initShortcuts() {
@@ -1487,7 +1566,7 @@ function initShortcuts() {
       j: () => stepList(1),
       k: () => stepList(-1),
       g: gChord,
-      G: () => { while ($("lib-more")) appendRows(); const it = listItems(); focusItem(it, it.length - 1); },
+      G: () => { stage.scrollTop = stage.scrollHeight; drawWindow(); const it = listItems(); focusItem(it, it.length - 1); },
       "/": () => { showView("library"); $("library-search").focus(); },
       "?": () => dlg.showModal(),
     };
@@ -1606,7 +1685,6 @@ function renderPlaylistDetail() {
 }
 
 // Cover: up to four distinct album covers as a 2x2 mosaic, one if fewer, a dashed square when there are none.
-const plCoverCache = new Map();
 let plCoverToken = 0;
 const coverKey = (name) => `plcover:${name}`;
 
@@ -1623,11 +1701,13 @@ async function paintPlaylistCover(paths) {
     return;
   }
   const urls = [];
+  const dirs = new Set(); // one cover per folder: tracks of an album share theirs
   for (const p of paths.slice(0, 16)) {
     if (urls.length >= 4) break;
-    if (!plCoverCache.has(p)) plCoverCache.set(p, await invoke("get_cover", { filePath: p }).catch(() => null));
-    const u = plCoverCache.get(p);
-    if (u && !urls.includes(u)) urls.push(u);
+    const dir = p.replace(/[\\/][^\\/]*$/, "");
+    if (dirs.has(dir)) continue;
+    const u = await coverUrl(p);
+    if (u) { dirs.add(dir); urls.push(u); }
   }
   if (token !== plCoverToken) return; // the page changed while covers were loading
   box.className = "pl-cover" + (!urls.length ? " empty" : urls.length < 4 ? " one" : "") + (openPl.smart ? " locked" : "");
@@ -1783,7 +1863,7 @@ function initPalette() {
       const albums = new Map();
       currentTrackList.forEach((t, i) => {
         if (!has(q, t.album, t.artist)) return;
-        const k = `${t.album}\u0000${t.artist}`;
+        const k = `${t.album}\u001f${t.artist}`;
         albums.set(k, [...(albums.get(k) || []), i]);
       });
       [...albums.values()].slice(0, 4).forEach((idxs) => {

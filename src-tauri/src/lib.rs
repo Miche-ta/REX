@@ -65,11 +65,6 @@ fn get_volume(device_id: String) -> Option<u32> {
 }
 
 #[tauri::command(async)]
-fn get_cover(file_path: String) -> Option<String> {
-    library::get_cover(&file_path)
-}
-
-#[tauri::command(async)]
 fn mpris_update(title: String, artist: String, album: String, length_secs: f64, file_path: Option<String>,
                 can_next: bool, can_prev: bool, status: String) {
     let art = file_path.as_deref().and_then(cover_file_url).unwrap_or_default();
@@ -225,15 +220,49 @@ fn get_visualizer_frame(state: State<'_, AppState>) -> visualizer::VisFrame {
     state.engine.get_visualizer_frame()
 }
 
-#[tauri::command(async)]
-fn scan_music_directory(state: State<'_, AppState>, dir_path: Option<String>) -> Vec<TrackInfo> {
-    let target_dir = dir_path.unwrap_or_else(|| paths::default_music_dir().display().to_string());
+/// Bumped by every new scan and by cancel_scan; a running scan stops once the number is no longer its own.
+static SCAN_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    let tracks = scan_directory(&target_dir);
+/// Scans in the background, emitting `scan-progress` [done, total] about 10 times a second.
+/// Fails with "cancelled" when cancel_scan (or a newer scan) stops it.
+#[tauri::command(async)]
+fn scan_music_directory(app: tauri::AppHandle, state: State<'_, AppState>, dir_path: Option<String>) -> Result<Vec<TrackInfo>, String> {
+    use std::sync::atomic::Ordering;
+    use tauri::Emitter;
+    let target_dir = dir_path.unwrap_or_else(|| paths::default_music_dir().display().to_string());
+    let generation = SCAN_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut last = std::time::Instant::now();
+
+    let tracks = scan_directory(&target_dir, &mut |done, total| {
+        if done == total || last.elapsed().as_millis() >= 100 {
+            last = std::time::Instant::now();
+            let _ = app.emit("scan-progress", (done, total));
+        }
+        SCAN_GEN.load(Ordering::SeqCst) == generation
+    }).ok_or("cancelled")?;
     if let Ok(mut cache) = state.cached_library.lock() {
         *cache = tracks.clone();
     }
-    tracks
+    Ok(tracks)
+}
+
+#[tauri::command(async)]
+fn cancel_scan() {
+    SCAN_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// `cover://` serves cover images straight to <img>, so pictures skip the JSON/base64 IPC round-trip.
+/// The path is the URL-encoded track path (what convertFileSrc(path, "cover") builds). 404 = no cover.
+fn cover_protocol(request: tauri::http::Request<Vec<u8>>, responder: tauri::UriSchemeResponder) {
+    std::thread::spawn(move || {
+        let raw = request.uri().path().trim_start_matches('/');
+        let path = percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
+        let res = match library::cover_bytes(&path) {
+            Some((bytes, mime)) => tauri::http::Response::builder().header("Content-Type", mime).body(bytes),
+            None => tauri::http::Response::builder().status(404).body(Vec::new()),
+        };
+        responder.respond(res.unwrap_or_default());
+    });
 }
 
 #[tauri::command(async)]
@@ -281,6 +310,13 @@ fn get_kernel_hw_params() -> String {
 #[tauri::command(async)]
 fn get_cached_library(dir_path: String) -> Vec<TrackInfo> {
     library::cached_tracks(&dir_path)
+}
+
+/// File paths in this folder's library matching the search box (full-text, see library::search).
+/// None = no database yet; the page then falls back to a plain substring filter.
+#[tauri::command(async)]
+fn search_library(dir_path: String, query: String) -> Option<Vec<String>> {
+    library::search(&dir_path, &query)
 }
 
 #[tauri::command(async)]
@@ -373,11 +409,11 @@ pub fn run() {
             Ok(())
         })
         .manage(app_state)
+        .register_asynchronous_uri_scheme_protocol("cover", |_ctx, request, responder| cover_protocol(request, responder))
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             list_audio_devices,
             play_track,
-            get_cover,
             get_lyrics,
             get_online_lyrics_cached,
             fetch_online_lyrics,
@@ -398,12 +434,14 @@ pub fn run() {
             get_playback_status,
             get_visualizer_frame,
             scan_music_directory,
+            cancel_scan,
             get_default_music_dir,
             get_engine_logs,
             clear_engine_logs,
             get_kernel_hw_params,
             get_diagnostics,
             get_cached_library,
+            search_library,
             get_settings,
             set_ui_value,
             set_audio_buffer,

@@ -82,16 +82,21 @@ impl WasapiBackend {
             AUDCLNT_SHAREMODE_SHARED
         };
 
-        let (out_fmt, lossless) = pick_format(req.bits, |fmt| {
-            let wfx = build_wave_format(req.sample_rate, req.channels, fmt);
-            unsafe {
-                client
-                    .IsFormatSupported(share_mode, &wfx.Format, None)
-                    .is_ok()
-            }
-        });
+        // WASAPI has no "nearest rate": walk the rates until the device takes one (the engine resamples)
+        let supports = |rate: u32, fmt: OutFmt| unsafe {
+            let wfx = build_wave_format(rate, req.channels, fmt);
+            client.IsFormatSupported(share_mode, &wfx.Format, None).is_ok()
+        };
+        let all_fmts = [OutFmt::S32, OutFmt::S24Low, OutFmt::S243, OutFmt::S16];
+        let hw_rate = crate::pcm_format::fallback_rates(req.sample_rate).into_iter()
+            .find(|&r| all_fmts.iter().any(|&f| supports(r, f)))
+            .unwrap_or(req.sample_rate); // nothing reported as supported: try the track's rate and let Initialize say why
+        if hw_rate != req.sample_rate {
+            log_msg("WASAPI", format!("'{}' does not take {} Hz; opening at {hw_rate} Hz", req.device_id, req.sample_rate));
+        }
+        let (out_fmt, lossless) = pick_format(req.bits, |fmt| supports(hw_rate, fmt));
 
-        let wfx = build_wave_format(req.sample_rate, req.channels, out_fmt);
+        let wfx = build_wave_format(hw_rate, req.channels, out_fmt);
         let cfg = crate::settings::get();
         let mut period_hns = (cfg.period_ms as i64).max(10) * 10_000;
 
@@ -118,7 +123,7 @@ impl WasapiBackend {
                 if e.code() == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED {
                     let aligned_frames = client.GetBufferSize().unwrap_or(1024);
                     let aligned_hns =
-                        (aligned_frames as i64 * 10_000_000) / req.sample_rate.max(1) as i64;
+                        (aligned_frames as i64 * 10_000_000) / hw_rate.max(1) as i64;
                     client
                         .Initialize(
                             share_mode,
@@ -161,7 +166,7 @@ impl WasapiBackend {
                 "Opened '{}' ({}) · {} Hz · {} · {} frames",
                 req.device_id,
                 if exclusive { "Exclusive" } else { "Shared" },
-                req.sample_rate,
+                hw_rate,
                 fmt_label,
                 buffer_frames
             ),
@@ -169,7 +174,7 @@ impl WasapiBackend {
 
         let info = OpenInfo {
             device_id: req.device_id.clone(),
-            hw_rate: req.sample_rate,
+            hw_rate,
             channels: req.channels,
             wide: req.bits >= 24,
             out_fmt,

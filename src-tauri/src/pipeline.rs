@@ -450,6 +450,8 @@ impl Writer {
             }
             Err(()) => {
                 self.pipe.set_open(None);
+                self.with_status(|st| st.open_failures += 1);
+                announce();
                 if let Some(r) = reply { let _ = r.send(Err(())); }
             }
         }
@@ -915,7 +917,8 @@ impl Track {
         let req = OpenReq { device_id: device_id.to_string(), sample_rate, channels, bits };
         let info = Self::request_open(c, req)?;
 
-        let is_hw = device_id.starts_with("hw:") || device_id.starts_with("plughw:");
+        // direct to the device: ALSA hw:, WASAPI exclusive (any id but "default"), CoreAudio hog mode
+        let is_hw = ["hw:", "plughw:", "wasapi:", "coreaudio:"].iter().any(|p| device_id.starts_with(p));
         let bit_perfect = is_hw && info.hw_rate == sample_rate && info.lossless;
         let bp_lock = crate::settings::get().bit_perfect_lock;
         let signal_mode = if bit_perfect && bp_lock {

@@ -32,6 +32,7 @@ pub struct PlaybackStatus {
     pub vu_right: f32,
     pub device_disconnected: bool, // true when USB DAC was unplugged mid-playback and awaiting reconnect
     pub signal_mode: String, // e.g. "Bit-Perfect Direct", "DoP (DSD64)", "Software Resampled"
+    pub open_failures: u64, // bumps when the output device refuses to open; the page shows a message
 }
 
 impl Default for PlaybackStatus {
@@ -55,6 +56,7 @@ impl Default for PlaybackStatus {
             active_period_frames: 0,
             is_bit_perfect: false,
             ended: false,
+            open_failures: 0,
             replay_gain_db: 0.0,
             decoder_serial: 0,
             decoding_path: None,

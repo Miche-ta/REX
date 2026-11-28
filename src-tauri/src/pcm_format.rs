@@ -62,6 +62,21 @@ pub fn pick_format(source_bits: u32, supported: impl Fn(OutFmt) -> bool) -> (Out
     (OutFmt::S16, !wide)
 }
 
+/// Rates to try when a device refuses the track's own rate, best first: the rate itself, then lower
+/// rates of the same family (192k -> 96k -> 48k: integer ratios resample cleanly), then the other
+/// family from the top. Backends without a "nearest rate" call (WASAPI) walk this list.
+#[cfg_attr(not(windows), allow(dead_code))] // only WASAPI walks it
+pub fn fallback_rates(rate: u32) -> Vec<u32> {
+    const RATES: [u32; 10] = [768000, 705600, 384000, 352800, 192000, 176400, 96000, 88200, 48000, 44100];
+    let family = |r: u32| r % 44100 == 0;
+    let mut out = vec![rate];
+    out.extend(RATES.iter().copied().filter(|&r| r < rate && family(r) == family(rate)));
+    out.extend(RATES.iter().copied().filter(|&r| r < rate && family(r) != family(rate)));
+    out.extend(RATES.iter().copied().filter(|&r| r > rate).rev()); // only above as a last resort
+    out.dedup();
+    out
+}
+
 /// Can the PCM that is already open carry the next track as it is? Same device, rate, channel count
 /// and sample width: yes. Anything else needs a reopen so the DAC gets the right parameters.
 pub fn can_reuse(open: (&str, u32, u32, bool), next: (&str, u32, u32, bool)) -> bool {
@@ -148,5 +163,14 @@ mod tests {
         let mut out = Vec::new();
         pack_s24_3(&[0; 8], &mut out);
         assert_eq!(out.len(), 24);
+    }
+
+    #[test]
+    fn fallback_prefers_same_family_below_then_the_other_family() {
+        assert_eq!(&fallback_rates(192000)[..4], &[192000, 96000, 48000, 176400]);
+        assert_eq!(&fallback_rates(88200)[..3], &[88200, 44100, 48000]);
+        assert_eq!(fallback_rates(44100).last(), Some(&768000));
+        let all = fallback_rates(96000);
+        assert_eq!(all.len(), 10, "every standard rate once");
     }
 }
